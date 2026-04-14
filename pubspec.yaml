@@ -30,7 +30,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  record: ^5.1.0        # Para grabar audio y crear el .wav
+  record: ^6.1.0        # Para grabar audio y crear el .wav
   http: ^1.1.0          # Para enviar el archivo al plugin (WiFi/USB)
   path_provider: ^2.1.1 # Para saber dónde guardar el audio temporalmente
 
