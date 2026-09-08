@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'package:record/record.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:osc/osc.dart';
@@ -186,6 +187,10 @@ class _RemoteScreenState extends State<RemoteScreen> {
   final AudioRecorder libraryRecorder = AudioRecorder();
   bool isLibraryRecording = false;
   List<RecordingEntry> recordings = [];
+  // Reproductor para previsualizar una grabacion desde el propio movil antes
+  // de mandarla al plugin.
+  final AudioPlayer previewPlayer = AudioPlayer();
+  String? previewingPath;
 
   @override
   void initState() {
@@ -197,6 +202,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
   @override
   void dispose() {
     _receiveSocket?.close();
+    previewPlayer.dispose();
     super.dispose();
   }
 
@@ -387,7 +393,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
 
   Future<void> _promptNameAndSave(BuildContext context, String tempPath) async {
     final controller = TextEditingController(
-      text: "Grabación ${recordings.length + 1}",
+      text: "Recording ${recordings.length + 1}",
     );
     final name = await showDialog<String>(
       context: context,
@@ -399,7 +405,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
           side: BorderSide(color: activeColor.withOpacity(0.4)),
         ),
         title: Text(
-          "NOMBRE DE LA GRABACIÓN",
+          "RECORDING NAME",
           style: TextStyle(
             color: activeColor,
             fontSize: 13,
@@ -425,7 +431,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, null),
             child: const Text(
-              "CANCELAR",
+              "CANCEL",
               style: TextStyle(color: Colors.white38),
             ),
           ),
@@ -433,7 +439,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
             onPressed: () =>
                 Navigator.pop(dialogContext, controller.text.trim()),
             child: Text(
-              "GUARDAR",
+              "SAVE",
               style: TextStyle(color: activeColor, fontWeight: FontWeight.bold),
             ),
           ),
@@ -458,7 +464,37 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   Future<void> _sendRecordingToLayer(RecordingEntry entry) async {
+    // El plugin solo abre su servidor TCP (puerto 8080) mientras esta
+    // "grabando en modo WIFI" (senal OSC _R_MODE=1 + _REC=1, ver
+    // TcpReceiver::startListening y PluginProcessor::parameterChanged). En
+    // el flujo normal del boton REC de arriba esto ya llega abierto porque
+    // esas señales se mandan al EMPEZAR a grabar y el socket sigue abierto
+    // hasta despues de subir el archivo. Aqui, al enviar algo ya grabado de
+    // la libreria, no hay ninguna grabacion en curso, asi que hay que abrir
+    // el socket nosotros mismos justo antes de subir (si no, el POST no
+    // encuentra nadie escuchando y falla en silencio).
+    sendOscMessage('/${selectedLayer}_R_MODE', 1.0);
+    sendOscMessage('/${selectedLayer}_REC', 1.0);
+    await Future.delayed(const Duration(milliseconds: 200));
     await sendAudioToPlugin(entry.filePath);
+  }
+
+  // Reproduce (o para si ya se esta reproduciendo) una grabacion, para poder
+  // escucharla desde el propio movil antes de decidir enviarla.
+  Future<void> _togglePreview(RecordingEntry entry) async {
+    if (previewingPath == entry.filePath) {
+      await previewPlayer.stop();
+      setState(() => previewingPath = null);
+      return;
+    }
+    await previewPlayer.stop();
+    await previewPlayer.play(DeviceFileSource(entry.filePath));
+    setState(() => previewingPath = entry.filePath);
+    previewPlayer.onPlayerComplete.first.then((_) {
+      if (mounted && previewingPath == entry.filePath) {
+        setState(() => previewingPath = null);
+      }
+    });
   }
 
   Future<void> _deleteRecording(RecordingEntry entry) async {
@@ -1108,6 +1144,10 @@ class _RemoteScreenState extends State<RemoteScreen> {
   Widget buildRecorderPanel(BuildContext context) {
     return Column(
       children: [
+        // Hueco antes del boton: el halo rojo al grabar (blurRadius 30 +
+        // spreadRadius 6) necesita mas de 25px de aire para no chocar con
+        // el borde superior de la caja y quedar cortado en seco por arriba.
+        const SizedBox(height: 20),
         GestureDetector(
           onTap: () => toggleLibraryRecording(context),
           child: AnimatedContainer(
@@ -1123,12 +1163,15 @@ class _RemoteScreenState extends State<RemoteScreen> {
                 color: isLibraryRecording ? Colors.red : activeColor,
                 width: isLibraryRecording ? 0 : 2,
               ),
+              // Halo pequeño a proposito (mucho mas contenido que el REC de
+              // arriba): este boton esta cerca del borde superior de la caja
+              // y un halo grande llegaba a rozarlo.
               boxShadow: isLibraryRecording
                   ? [
                       const BoxShadow(
                         color: Colors.redAccent,
-                        blurRadius: 30,
-                        spreadRadius: 6,
+                        blurRadius: 10,
+                        spreadRadius: 1,
                       ),
                     ]
                   : [],
@@ -1142,7 +1185,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
         ),
         const SizedBox(height: 10),
         Text(
-          isLibraryRecording ? "GRABANDO..." : "TOCA PARA GRABAR",
+          isLibraryRecording ? "RECORDING..." : "TAP TO RECORD",
           style: TextStyle(
             color: isLibraryRecording ? Colors.redAccent : Colors.white38,
             fontSize: 11,
@@ -1155,7 +1198,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
           child: recordings.isEmpty
               ? Center(
                   child: Text(
-                    "Sin grabaciones todavía",
+                    "No recordings yet",
                     style: TextStyle(
                       color: Colors.white.withOpacity(0.24),
                       fontSize: 12,
@@ -1196,6 +1239,26 @@ class _RemoteScreenState extends State<RemoteScreen> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          // PLAY: previsualiza la grabacion desde el propio movil.
+          GestureDetector(
+            onTap: () => _togglePreview(entry),
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: activeColor.withOpacity(0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                previewingPath == entry.filePath
+                    ? Icons.stop_rounded
+                    : Icons.play_arrow_rounded,
+                size: 16,
+                color: activeColor,
+              ),
+            ),
+          ),
+          // SEND: sube la grabacion al layer que este seleccionado arriba.
           GestureDetector(
             onTap: () => _sendRecordingToLayer(entry),
             child: Container(

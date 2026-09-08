@@ -44,6 +44,8 @@ enum _DragTarget { none, pad, bar }
 class _VoicePadState extends State<VoicePad> {
   _DragTarget _target = _DragTarget.none;
   int? _activePointer;
+  // Para detectar doble-toque a mano (Listener no trae deteccion de gestos).
+  DateTime? _lastPadDownTime;
 
   static const double _gapBeforeBar = 8;
   static const double _barHeight = 24;
@@ -85,6 +87,18 @@ class _VoicePadState extends State<VoicePad> {
     }
     final pad = _padRect(size);
     if (pad.contains(pos)) {
+      final now = DateTime.now();
+      final isDoubleTap =
+          _lastPadDownTime != null &&
+          now.difference(_lastPadDownTime!) < const Duration(milliseconds: 300);
+      _lastPadDownTime = now;
+      if (isDoubleTap) {
+        _lastPadDownTime = null;
+        widget.onXChanged(0.5);
+        widget.onYChanged(0.5);
+        return;
+      }
+
       _target = _DragTarget.pad;
       _activePointer = event.pointer;
       _updatePad(pos, pad);
@@ -202,12 +216,12 @@ class _VoicePadPainter extends CustomPainter {
     final dotY = padRect.top + (1.0 - y) * padRect.height;
     canvas.drawCircle(
       Offset(dotX, dotY),
-      10,
+      15,
       Paint()
         ..color = color.withOpacity(0.3)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4),
     );
-    canvas.drawCircle(Offset(dotX, dotY), 5, Paint()..color = color);
+    canvas.drawCircle(Offset(dotX, dotY), 8, Paint()..color = color);
 
     // Barra de MIX (estilo LinearBar, mas gruesa): recta (no en pildora),
     // con borde brillando sutil y relleno neon mas apagado/elegante.
