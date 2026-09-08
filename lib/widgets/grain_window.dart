@@ -12,9 +12,13 @@ import 'package:flutter/material.dart';
 //
 // Gestos (con Listener, no GestureDetector, para no perder la "arena de
 // gestos" contra el PageView deslizante que envuelve este panel):
-//   - 1 dedo, arrastre horizontal -> Position
-//   - 1 dedo, arrastre vertical   -> Shape (abajo = mas "cuadrada"/ataque)
-//   - 2 dedos, pellizco           -> Grain Size
+//   - 1 dedo, SOLO SI el toque empieza encima de la ventana/palito, arrastre
+//     horizontal 1:1 con el dedo -> Position. Tocar en cualquier otro sitio
+//     NO mueve la posicion de un salto (era molesto: un pellizco con los 2
+//     dedos llegando en momentos ligeramente distintos se registraba primero
+//     como "1 dedo" y saltaba la posicion antes de empezar el pellizco).
+//   - 1 dedo, arrastre vertical (relativo) -> Shape, desde cualquier punto.
+//   - 2 dedos, pellizco -> Grain Size (y Shape si ademas se mueve en vertical).
 class GrainWindow extends StatefulWidget {
   final double position;
   final double grainSize;
@@ -45,20 +49,47 @@ class GrainWindow extends StatefulWidget {
 }
 
 class _GrainWindowState extends State<GrainWindow> {
-  // pointerId -> ultima posicion conocida (para deltas incrementales).
+  // pointerId -> ultima posicion conocida (para el delta vertical de Shape).
   final Map<int, Offset> _pointers = {};
   int? _primaryPointer; // el dedo que controla Position/Shape
+  // Solo se permite arrastrar Position si el toque EMPEZO encima de la
+  // ventana dibujada (si no, un toque en cualquier lado la haria saltar, y
+  // un pellizco cuyos 2 dedos llegan en momentos ligeramente distintos se
+  // registraba primero como "1 dedo" y daba un salto brusco no deseado).
+  bool _positionArmed = false;
   double? _pinchStartDistance;
   double? _pinchStartSize;
+
+  // Mismo margen y formula de ancho que usa el painter para la ventana: hace
+  // falta para saber si un toque cae encima de ella.
+  static const double _trackMargin = 12.0;
+
+  bool _isOnWindow(Offset pos, Size size) {
+    final trackWidth = size.width - _trackMargin * 2;
+    final winWidth = (0.12 + widget.grainSize * 0.8) * trackWidth;
+    final centerX = _trackMargin + widget.position * trackWidth;
+    const extraTouchMargin = 14.0; // un poco mas generoso que el dibujo exacto
+    return (pos.dx - centerX).abs() <= (winWidth / 2) + extraTouchMargin;
+  }
+
+  void _updatePositionAbsolute(double x, double width) {
+    final trackWidth = width - _trackMargin * 2;
+    final newPos = ((x - _trackMargin) / trackWidth).clamp(0.0, 1.0);
+    widget.onPositionChanged(newPos);
+  }
 
   void _onDown(PointerDownEvent event, Size size) {
     _pointers[event.pointer] = event.localPosition;
     if (_pointers.length == 1) {
       _primaryPointer = event.pointer;
+      _positionArmed = _isOnWindow(event.localPosition, size);
     } else if (_pointers.length == 2) {
       final pts = _pointers.values.toList();
       _pinchStartDistance = (pts[0] - pts[1]).distance;
       _pinchStartSize = widget.grainSize;
+      // Si llega un 2o dedo, cancelamos cualquier arrastre de posicion que
+      // hubiera empezado el 1o: a partir de aqui manda el pellizco.
+      _positionArmed = false;
     }
     widget.onDragActiveChanged?.call(true);
   }
@@ -68,7 +99,9 @@ class _GrainWindowState extends State<GrainWindow> {
     _pointers[event.pointer] = event.localPosition;
 
     if (_pointers.length >= 2) {
-      // Pellizco con 2 dedos: solo cambia el tamano, ignora posicion/forma.
+      // Pellizco con 2 dedos: cambia el tamano. Y si ADEMAS alguno de los 2
+      // dedos se mueve verticalmente, tambien cambia la forma a la vez (antes
+      // se ignoraba la forma en cuanto habia 2 dedos, y no se podian combinar).
       final pts = _pointers.values.toList();
       final distance = (pts[0] - pts[1]).distance;
       final start = _pinchStartDistance;
@@ -76,15 +109,24 @@ class _GrainWindowState extends State<GrainWindow> {
         final newSize = (_pinchStartSize! * (distance / start)).clamp(0.0, 1.0);
         widget.onGrainSizeChanged(newSize);
       }
+      if (previous != null) {
+        final deltaY = event.localPosition.dy - previous.dy;
+        final newShape = (widget.shape - deltaY / size.height).clamp(0.0, 1.0);
+        widget.onShapeChanged(newShape);
+      }
       return;
     }
 
     if (event.pointer == _primaryPointer && previous != null) {
-      final delta = event.localPosition - previous;
-      final newPos = (widget.position + delta.dx / size.width).clamp(0.0, 1.0);
-      widget.onPositionChanged(newPos);
+      // Position: solo si el toque empezo encima de la ventana, y entonces
+      // 1:1 con el dedo (no incremental).
+      if (_positionArmed) {
+        _updatePositionAbsolute(event.localPosition.dx, size.width);
+      }
+      // Shape: relativo, funciona desde cualquier punto de la caja.
       // Arriba = mas "cuadrada" (mas ataque); abajo = mas curva (Hann).
-      final newShape = (widget.shape - delta.dy / size.height).clamp(0.0, 1.0);
+      final deltaY = event.localPosition.dy - previous.dy;
+      final newShape = (widget.shape - deltaY / size.height).clamp(0.0, 1.0);
       widget.onShapeChanged(newShape);
     }
   }
@@ -93,6 +135,7 @@ class _GrainWindowState extends State<GrainWindow> {
     _pointers.remove(event.pointer);
     if (event.pointer == _primaryPointer) {
       _primaryPointer = _pointers.isNotEmpty ? _pointers.keys.first : null;
+      _positionArmed = false;
     }
     if (_pointers.length < 2) {
       _pinchStartDistance = null;
@@ -155,20 +198,23 @@ class _GrainWindowPainter extends CustomPainter {
         ..strokeWidth = 1.2,
     );
 
-    // Pista horizontal (representa el sample completo)
+    // Pista horizontal (representa el sample completo). Mismo margen que usa
+    // _GrainWindowState para mapear el dedo, para que el palito quede
+    // exactamente alineado con la posicion real del toque.
+    const margin = _GrainWindowState._trackMargin;
     final trackY = size.height / 2;
     canvas.drawLine(
-      Offset(12, trackY),
-      Offset(size.width - 12, trackY),
+      Offset(margin, trackY),
+      Offset(size.width - margin, trackY),
       Paint()
         ..color = color.withOpacity(0.25)
         ..strokeWidth = 1.0,
     );
 
-    final trackWidth = size.width - 24;
+    final trackWidth = size.width - margin * 2;
     final winWidth = (0.12 + grainSize * 0.8) * trackWidth;
     final winHeight = size.height * 0.7;
-    final centerX = 12 + position * trackWidth;
+    final centerX = margin + position * trackWidth;
     final left = centerX - winWidth / 2;
     final bottom = trackY + winHeight / 2;
 
@@ -206,6 +252,17 @@ class _GrainWindowPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 6.0
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
+    );
+
+    // "Palito" de posicion: igual que PluginEditor.cpp (linea blanca vertical
+    // en el centro exacto de la ventana de grano, de arriba a abajo), se
+    // mueve con el dedo porque sigue directamente a Position.
+    canvas.drawLine(
+      Offset(centerX, 4),
+      Offset(centerX, size.height - 4),
+      Paint()
+        ..color = Colors.white.withOpacity(0.9)
+        ..strokeWidth = 2.0,
     );
   }
 

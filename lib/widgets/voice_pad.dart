@@ -2,9 +2,13 @@ import 'package:flutter/material.dart';
 
 // Replica de XYPad + la barra "MIX" de FxFormantModule.cpp del synth: un
 // cuadrado donde una bolita marca 2 parametros (X/Y, formante de vocal) y,
-// debajo, una barra horizontal fina para "cuanto se quiere" (MIX), igual que
-// el LinearBar mapeable que aparece bajo cada uno de los 4 "monjes" (voces)
-// en el plugin. Misma reticula central, mismo halo de color de capa.
+// debajo, una barra horizontal para "cuanto se quiere" (MIX), igual que el
+// LinearBar mapeable que aparece bajo cada uno de los 4 "monjes" (voces) en
+// el plugin. Misma reticula central, mismo halo de color de capa.
+//
+// La barra es gruesa y con una zona de toque bastante mas alta que su alto
+// visual: con 4 de estos apretados en una rejilla 2x2, una barra fina era
+// muy facil de fallar y el toque se colaba al swipe de cambiar de engine.
 class VoicePad extends StatefulWidget {
   final String label;
   final double x;
@@ -41,20 +45,19 @@ class _VoicePadState extends State<VoicePad> {
   _DragTarget _target = _DragTarget.none;
   int? _activePointer;
 
-  static const double _labelHeight = 14;
-  static const double _gapAfterLabel = 4;
-  static const double _gapBeforeBar = 6;
-  static const double _barHeight = 10;
+  static const double _gapBeforeBar = 8;
+  static const double _barHeight = 24;
+  // La zona de toque de la barra es mas alta que su dibujo, para que sea
+  // facil de agarrar aunque el dedo no caiga justo en el pixel visual.
+  static const double _barHitPadding = 16;
 
-  Rect _padRect(Size size) => Rect.fromLTWH(
-    0,
-    _labelHeight + _gapAfterLabel,
-    size.width,
-    size.height - _labelHeight - _gapAfterLabel - _gapBeforeBar - _barHeight,
-  );
+  Rect _padRect(Size size) =>
+      Rect.fromLTWH(0, 0, size.width, size.height - _gapBeforeBar - _barHeight);
 
   Rect _barRect(Size size) =>
       Rect.fromLTWH(0, size.height - _barHeight, size.width, _barHeight);
+
+  Rect _barHitRect(Size size) => _barRect(size).inflate(_barHitPadding);
 
   void _updatePad(Offset pos, Rect pad) {
     final x = ((pos.dx - pad.left) / pad.width).clamp(0.0, 1.0);
@@ -70,18 +73,21 @@ class _VoicePadState extends State<VoicePad> {
 
   void _onDown(PointerDownEvent event, Size size) {
     final pos = event.localPosition;
+    // La barra se comprueba primero (y con su zona ampliada) porque su franja
+    // visual es pequeña y esta pegada al borde inferior del pad.
+    final barHit = _barHitRect(size);
+    if (barHit.contains(pos)) {
+      _target = _DragTarget.bar;
+      _activePointer = event.pointer;
+      _updateBar(pos, _barRect(size));
+      widget.onDragActiveChanged?.call(true);
+      return;
+    }
     final pad = _padRect(size);
-    final bar = _barRect(size);
-
     if (pad.contains(pos)) {
       _target = _DragTarget.pad;
       _activePointer = event.pointer;
       _updatePad(pos, pad);
-      widget.onDragActiveChanged?.call(true);
-    } else if (bar.inflate(10).contains(pos)) {
-      _target = _DragTarget.bar;
-      _activePointer = event.pointer;
-      _updateBar(pos, bar);
       widget.onDragActiveChanged?.call(true);
     }
   }
@@ -143,30 +149,11 @@ class _VoicePadPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // Etiqueta ("V1".."V4")
-    final tp = TextPainter(
-      text: TextSpan(
-        text: label,
-        style: TextStyle(
-          color: color.withOpacity(0.85),
-          fontSize: 10,
-          fontWeight: FontWeight.bold,
-          letterSpacing: 1.2,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, const Offset(0, 0));
-
     final padRect = Rect.fromLTWH(
       0,
-      _VoicePadState._labelHeight + _VoicePadState._gapAfterLabel,
+      0,
       size.width,
-      size.height -
-          _VoicePadState._labelHeight -
-          _VoicePadState._gapAfterLabel -
-          _VoicePadState._gapBeforeBar -
-          _VoicePadState._barHeight,
+      size.height - _VoicePadState._gapBeforeBar - _VoicePadState._barHeight,
     );
     final padRRect = RRect.fromRectAndRadius(padRect, const Radius.circular(6));
 
@@ -194,6 +181,22 @@ class _VoicePadPainter extends CustomPainter {
       gridPaint,
     );
 
+    // Etiqueta ("V1".."V4"), superpuesta en la esquina del pad (no ocupa
+    // fila propia, para dejarle todo el alto posible al pad y a la barra).
+    final tp = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: color.withOpacity(0.7),
+          fontSize: 9,
+          fontWeight: FontWeight.bold,
+          letterSpacing: 1.0,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas, Offset(padRect.left + 5, padRect.top + 3));
+
     // Bolita (Y invertida: 1.0 arriba, igual que en el synth)
     final dotX = padRect.left + x * padRect.width;
     final dotY = padRect.top + (1.0 - y) * padRect.height;
@@ -206,27 +209,47 @@ class _VoicePadPainter extends CustomPainter {
     );
     canvas.drawCircle(Offset(dotX, dotY), 5, Paint()..color = color);
 
-    // Barra de MIX (estilo LinearBar): fondo + relleno hasta "mix"
+    // Barra de MIX (estilo LinearBar, mas gruesa): recta (no en pildora),
+    // con borde brillando sutil y relleno neon mas apagado/elegante.
     final barRect = Rect.fromLTWH(
       0,
       size.height - _VoicePadState._barHeight,
       size.width,
       _VoicePadState._barHeight,
     );
-    final barRRect = RRect.fromRectAndRadius(barRect, const Radius.circular(4));
-    canvas.drawRRect(barRRect, Paint()..color = Colors.black.withOpacity(0.3));
-    final fillRect = Rect.fromLTWH(
-      barRect.left,
-      barRect.top,
-      barRect.width * mix,
-      barRect.height,
-    );
-    if (mix > 0.02) {
+    const barRadius = Radius.circular(4);
+    final barRRect = RRect.fromRectAndRadius(barRect, barRadius);
+    canvas.drawRRect(barRRect, Paint()..color = Colors.black.withOpacity(0.35));
+
+    if (mix > 0.01) {
+      final fillRect = Rect.fromLTWH(
+        barRect.left,
+        barRect.top,
+        barRect.width * mix,
+        barRect.height,
+      );
+      // Version bien apagada del color (parecida al tono de los bordes de
+      // los paneles) en vez del neon "chillon" a todo trapo.
+      final hsl = HSLColor.fromColor(color);
+      final softFill = hsl
+          .withSaturation((hsl.saturation * 0.4).clamp(0.0, 1.0))
+          .withLightness((hsl.lightness * 0.75).clamp(0.0, 1.0))
+          .toColor();
       canvas.drawRRect(
-        RRect.fromRectAndRadius(fillRect, const Radius.circular(4)),
-        Paint()..color = color.withOpacity(0.7),
+        RRect.fromRectAndRadius(fillRect, barRadius),
+        Paint()..color = softFill.withOpacity(0.55),
       );
     }
+
+    // Borde sutil brillando alrededor de toda la barra (encima del relleno).
+    canvas.drawRRect(
+      barRRect,
+      Paint()
+        ..color = color.withOpacity(0.7)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1.5),
+    );
   }
 
   @override

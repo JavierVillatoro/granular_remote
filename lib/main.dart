@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
+import 'dart:convert';
 import 'package:record/record.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -35,6 +36,32 @@ class GranularRemoteApp extends StatelessWidget {
   }
 }
 
+// Una grabacion guardada en la libreria local del engine "Recorder": queda
+// en el movil hasta que el usuario decide mandarla al layer que elija.
+class RecordingEntry {
+  final String name;
+  final String filePath;
+  final DateTime recordedAt;
+
+  RecordingEntry({
+    required this.name,
+    required this.filePath,
+    required this.recordedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'name': name,
+    'filePath': filePath,
+    'recordedAt': recordedAt.toIso8601String(),
+  };
+
+  factory RecordingEntry.fromJson(Map<String, dynamic> json) => RecordingEntry(
+    name: json['name'] as String,
+    filePath: json['filePath'] as String,
+    recordedAt: DateTime.parse(json['recordedAt'] as String),
+  );
+}
+
 class RemoteScreen extends StatefulWidget {
   const RemoteScreen({super.key});
 
@@ -63,6 +90,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
   // riesgo de tocar un parametro por error. El swipe entre paginas sigue
   // funcionando siempre, solo se bloquean los controles de dentro.
   bool engineLocked = false;
+  // Boton "pin" (fijo, siempre visible, arriba a la derecha de la caja):
+  // bloquea a mano el swipe entre engines por completo (al contrario que
+  // lockPageSwipe, que es automatico y momentaneo mientras se arrastra un
+  // control). Util cuando un modulo como Voices tiene barras finas y es
+  // facil deslizar sin querer a otro engine.
+  bool manualSwipeLock = false;
+  bool get swipeBlocked => lockPageSwipe || manualSwipeLock;
   // Menu de modulos: alternativa a arrastrar, para saltar directo a un engine.
   bool showModuleMenu = false;
 
@@ -146,10 +180,18 @@ class _RemoteScreenState extends State<RemoteScreen> {
   static const int _receivePort = 9001;
   static final RegExp _layerAddressPattern = RegExp(r'^/?(L[1-4])_(.+)$');
 
+  // --- ENGINE "RECORDER" (6to engine): libreria de audios local ---
+  // Grabadora aparte de la que ya usa el REC de arriba (esa sube en directo
+  // al momento; esta guarda en el movil hasta que el usuario elige enviarla).
+  final AudioRecorder libraryRecorder = AudioRecorder();
+  bool isLibraryRecording = false;
+  List<RecordingEntry> recordings = [];
+
   @override
   void initState() {
     super.initState();
     _startOscReceiver();
+    _loadRecordings();
   }
 
   @override
@@ -289,6 +331,142 @@ class _RemoteScreenState extends State<RemoteScreen> {
   void togglePlay() {
     setState(() => playStates[selectedLayer] = !isPlaying);
     sendOscMessage('/${selectedLayer}_PLAY', isPlaying ? 1.0 : 0.0);
+  }
+
+  // --- LIBRERIA DE GRABACIONES (engine Recorder) ---
+  Future<File> _recordingsManifestFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File('${dir.path}/recordings_manifest.json');
+  }
+
+  Future<void> _loadRecordings() async {
+    try {
+      final file = await _recordingsManifestFile();
+      if (!await file.exists()) return;
+      final content = await file.readAsString();
+      final list = jsonDecode(content) as List;
+      final loaded = list
+          .map((e) => RecordingEntry.fromJson(e as Map<String, dynamic>))
+          .toList();
+      setState(() => recordings = loaded);
+    } catch (e) {
+      print("Error cargando la libreria de grabaciones: $e");
+    }
+  }
+
+  Future<void> _saveRecordingsManifest() async {
+    try {
+      final file = await _recordingsManifestFile();
+      final content = jsonEncode(recordings.map((e) => e.toJson()).toList());
+      await file.writeAsString(content);
+    } catch (e) {
+      print("Error guardando la libreria de grabaciones: $e");
+    }
+  }
+
+  Future<void> toggleLibraryRecording(BuildContext context) async {
+    if (!isLibraryRecording) {
+      if (await libraryRecorder.hasPermission()) {
+        final dir = await getApplicationDocumentsDirectory();
+        final path =
+            '${dir.path}/rec_${DateTime.now().millisecondsSinceEpoch}.wav';
+        await libraryRecorder.start(
+          const RecordConfig(encoder: AudioEncoder.wav),
+          path: path,
+        );
+        setState(() => isLibraryRecording = true);
+      }
+    } else {
+      final path = await libraryRecorder.stop();
+      setState(() => isLibraryRecording = false);
+      if (path != null && context.mounted) {
+        await _promptNameAndSave(context, path);
+      }
+    }
+  }
+
+  Future<void> _promptNameAndSave(BuildContext context, String tempPath) async {
+    final controller = TextEditingController(
+      text: "Grabación ${recordings.length + 1}",
+    );
+    final name = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF16161A),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: activeColor.withOpacity(0.4)),
+        ),
+        title: Text(
+          "NOMBRE DE LA GRABACIÓN",
+          style: TextStyle(
+            color: activeColor,
+            fontSize: 13,
+            letterSpacing: 1.5,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white),
+          cursorColor: activeColor,
+          decoration: InputDecoration(
+            enabledBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: activeColor.withOpacity(0.4)),
+            ),
+            focusedBorder: UnderlineInputBorder(
+              borderSide: BorderSide(color: activeColor),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, null),
+            child: const Text(
+              "CANCELAR",
+              style: TextStyle(color: Colors.white38),
+            ),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: Text(
+              "GUARDAR",
+              style: TextStyle(color: activeColor, fontWeight: FontWeight.bold),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (name == null || name.isEmpty) {
+      try {
+        await File(tempPath).delete();
+      } catch (_) {}
+      return;
+    }
+
+    final entry = RecordingEntry(
+      name: name,
+      filePath: tempPath,
+      recordedAt: DateTime.now(),
+    );
+    setState(() => recordings.insert(0, entry));
+    _saveRecordingsManifest();
+  }
+
+  Future<void> _sendRecordingToLayer(RecordingEntry entry) async {
+    await sendAudioToPlugin(entry.filePath);
+  }
+
+  Future<void> _deleteRecording(RecordingEntry entry) async {
+    setState(() => recordings.remove(entry));
+    _saveRecordingsManifest();
+    try {
+      await File(entry.filePath).delete();
+    } catch (_) {}
   }
 
   // --- WIDGET: PAD DE COLOR ---
@@ -924,7 +1102,125 @@ class _RemoteScreenState extends State<RemoteScreen> {
     );
   }
 
-  // El PageView normal de los 5 engines, con la transicion de tamano/opacidad
+  // --- WIDGET: PANEL "RECORDER" (pagina 5 del panel deslizante) ---
+  // Grabadora portatil: graba, pide nombre al parar, y guarda una libreria
+  // local que se puede enviar mas tarde al layer seleccionado arriba.
+  Widget buildRecorderPanel(BuildContext context) {
+    return Column(
+      children: [
+        GestureDetector(
+          onTap: () => toggleLibraryRecording(context),
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 150),
+            height: 80,
+            width: 80,
+            decoration: BoxDecoration(
+              color: isLibraryRecording
+                  ? Colors.redAccent
+                  : const Color(0xFF1A1A1D),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: isLibraryRecording ? Colors.red : activeColor,
+                width: isLibraryRecording ? 0 : 2,
+              ),
+              boxShadow: isLibraryRecording
+                  ? [
+                      const BoxShadow(
+                        color: Colors.redAccent,
+                        blurRadius: 30,
+                        spreadRadius: 6,
+                      ),
+                    ]
+                  : [],
+            ),
+            child: Icon(
+              isLibraryRecording ? Icons.stop_rounded : Icons.mic_rounded,
+              color: isLibraryRecording ? Colors.white : activeColor,
+              size: 30,
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Text(
+          isLibraryRecording ? "GRABANDO..." : "TOCA PARA GRABAR",
+          style: TextStyle(
+            color: isLibraryRecording ? Colors.redAccent : Colors.white38,
+            fontSize: 11,
+            letterSpacing: 1.5,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        const SizedBox(height: 16),
+        Expanded(
+          child: recordings.isEmpty
+              ? Center(
+                  child: Text(
+                    "Sin grabaciones todavía",
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.24),
+                      fontSize: 12,
+                    ),
+                  ),
+                )
+              : ListView.separated(
+                  itemCount: recordings.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (context, i) =>
+                      _buildRecordingRow(recordings[i]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRecordingRow(RecordingEntry entry) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A1D),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: activeColor.withOpacity(0.2)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.graphic_eq_rounded,
+            size: 16,
+            color: activeColor.withOpacity(0.7),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              entry.name,
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          GestureDetector(
+            onTap: () => _sendRecordingToLayer(entry),
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: activeColor.withOpacity(0.12),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.upload_rounded, size: 16, color: activeColor),
+            ),
+          ),
+          GestureDetector(
+            onTap: () => _deleteRecording(entry),
+            child: const Padding(
+              padding: EdgeInsets.all(6),
+              child: Icon(Icons.close_rounded, size: 16, color: Colors.white38),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // El PageView normal de los 6 engines, con la transicion de tamano/opacidad
   // entre paginas. Extraido a su propio metodo para poder superponerlo con
   // el menu de modulos dentro del mismo recuadro (ver build()).
   Widget _buildEnginePageView() {
@@ -932,17 +1228,19 @@ class _RemoteScreenState extends State<RemoteScreen> {
       key: const ValueKey('enginePageView'),
       controller: enginePageController,
       // Se bloquea mientras se arrastra un puntito del filtro, la curva de
-      // EQ o la ventana de grano, para que no compitan por el mismo gesto.
-      physics: lockPageSwipe ? const NeverScrollableScrollPhysics() : null,
+      // EQ o la ventana de grano (para que no compitan por el mismo gesto),
+      // o si el usuario ha fijado el "pin" de swipe manualmente.
+      physics: swipeBlocked ? const NeverScrollableScrollPhysics() : null,
       onPageChanged: (page) => setState(() => currentEnginePage = page),
-      itemCount: 5,
+      itemCount: 6,
       itemBuilder: (context, index) {
         final page = switch (index) {
           0 => buildMixerPanel(context),
           1 => buildFilterPanel(context),
           2 => buildEnginePanel(context),
           3 => buildPitchPanel(context),
-          _ => buildVoicesPanel(context),
+          4 => buildVoicesPanel(context),
+          _ => buildRecorderPanel(context),
         };
         return AnimatedBuilder(
           animation: enginePageController,
@@ -980,71 +1278,84 @@ class _RemoteScreenState extends State<RemoteScreen> {
       (label: "GRANULAR", icon: Icons.grain_rounded),
       (label: "PITCH", icon: Icons.piano_rounded),
       (label: "VOICES", icon: Icons.record_voice_over_rounded),
+      (label: "RECORDER", icon: Icons.mic_rounded),
     ];
 
-    return Column(
+    // SingleChildScrollView (no un Column centrado con alto fijo): con solo
+    // 4-5 opciones cabia todo, pero al llegar a 6 (Recorder) se desbordaba
+    // (la caja tiene un alto fijo). A partir de ahora, cada modulo nuevo que
+    // se añada al menu simplemente se podra desplazar hacia abajo, sin
+    // volver a desbordar nunca pase lo que pase.
+    return SingleChildScrollView(
       key: const ValueKey('moduleMenu'),
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: List.generate(items.length, (i) {
-        final isActive = currentEnginePage == i;
-        final item = items[i];
-        return Padding(
-          padding: EdgeInsets.only(bottom: i == items.length - 1 ? 0 : 14),
-          child: GestureDetector(
-            onTap: () {
-              enginePageController.jumpToPage(i);
-              setState(() {
-                currentEnginePage = i;
-                showModuleMenu = false;
-              });
-            },
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              decoration: BoxDecoration(
-                color: isActive
-                    ? activeColor.withOpacity(0.15)
-                    : Colors.transparent,
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(
-                  color: activeColor.withOpacity(isActive ? 0.9 : 0.35),
-                  width: isActive ? 1.5 : 1,
-                ),
-                boxShadow: isActive
-                    ? [
-                        BoxShadow(
-                          color: activeColor.withOpacity(0.4),
-                          blurRadius: 16,
-                          spreadRadius: 1,
-                        ),
-                      ]
-                    : [],
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    item.icon,
-                    size: 18,
-                    color: activeColor.withOpacity(isActive ? 1.0 : 0.6),
+      child: Column(
+        children: List.generate(items.length, (i) {
+          final isActive = currentEnginePage == i;
+          final item = items[i];
+          return Padding(
+            padding: EdgeInsets.only(bottom: i == items.length - 1 ? 0 : 14),
+            child: GestureDetector(
+              onTap: () {
+                setState(() {
+                  currentEnginePage = i;
+                  showModuleMenu = false;
+                });
+                // animateToPage (no jumpToPage): transicion suave en vez de
+                // un salto seco al volver del menu a la pantalla de engines.
+                enginePageController.animateToPage(
+                  i,
+                  duration: const Duration(milliseconds: 450),
+                  curve: Curves.easeOutCubic,
+                );
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                decoration: BoxDecoration(
+                  color: isActive
+                      ? activeColor.withOpacity(0.15)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: activeColor.withOpacity(isActive ? 0.9 : 0.35),
+                    width: isActive ? 1.5 : 1,
                   ),
-                  const SizedBox(width: 10),
-                  Text(
-                    item.label,
-                    style: TextStyle(
-                      letterSpacing: 3,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
+                  boxShadow: isActive
+                      ? [
+                          BoxShadow(
+                            color: activeColor.withOpacity(0.4),
+                            blurRadius: 16,
+                            spreadRadius: 1,
+                          ),
+                        ]
+                      : [],
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      item.icon,
+                      size: 18,
                       color: activeColor.withOpacity(isActive ? 1.0 : 0.6),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 10),
+                    Text(
+                      item.label,
+                      style: TextStyle(
+                        letterSpacing: 3,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                        color: activeColor.withOpacity(isActive ? 1.0 : 0.6),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        );
-      }),
+          );
+        }),
+      ),
     );
   }
 
@@ -1184,26 +1495,31 @@ class _RemoteScreenState extends State<RemoteScreen> {
                     // abrir el menu, su PageController se queda sin cliente
                     // y jumpToPage() al elegir un modulo no hacia nada (por
                     // eso los botones del menu no respondian).
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(23),
-                      child: Stack(
-                        children: [
-                          Positioned.fill(child: _buildEnginePageView()),
-                          Positioned.fill(
-                            child: IgnorePointer(
-                              ignoring: !showModuleMenu,
-                              child: AnimatedOpacity(
-                                duration: const Duration(milliseconds: 200),
-                                opacity: showModuleMenu ? 1.0 : 0.0,
-                                child: Container(
-                                  color: const Color(0xFF16161A),
-                                  child: buildModuleMenuOverlay(context),
-                                ),
+                    //
+                    // Sin ClipRRect a proposito: el padding de 25 del propio
+                    // AnimatedContainer ya deja un margen mayor que el radio
+                    // de sus esquinas (24), asi que el contenido de dentro
+                    // (paginas y menu) nunca llega a las esquinas redondeadas.
+                    // Un ClipRRect aqui recortaba tambien el brillo/halo de
+                    // los dibujos (Filtro/Granular) justo en el borde
+                    // superior e inferior de la caja.
+                    child: Stack(
+                      children: [
+                        Positioned.fill(child: _buildEnginePageView()),
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            ignoring: !showModuleMenu,
+                            child: AnimatedOpacity(
+                              duration: const Duration(milliseconds: 200),
+                              opacity: showModuleMenu ? 1.0 : 0.0,
+                              child: Container(
+                                color: const Color(0xFF16161A),
+                                child: buildModuleMenuOverlay(context),
                               ),
                             ),
                           ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -1214,7 +1530,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                   children: [
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
-                      children: List.generate(5, (i) {
+                      children: List.generate(6, (i) {
                         final isActive = currentEnginePage == i;
                         return AnimatedContainer(
                           duration: const Duration(milliseconds: 250),
@@ -1262,31 +1578,74 @@ class _RemoteScreenState extends State<RemoteScreen> {
                     ),
                     Align(
                       alignment: Alignment.centerRight,
-                      child: GestureDetector(
-                        onTap: () =>
-                            setState(() => engineLocked = !engineLocked),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
-                          width: 34,
-                          height: 34,
-                          decoration: BoxDecoration(
-                            color: engineLocked
-                                ? activeColor.withOpacity(0.15)
-                                : const Color(0xFF1A1A1D),
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: engineLocked
-                                  ? activeColor
-                                  : Colors.white12,
-                              width: 1.5,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // BOTON "PIN": bloquea a mano el swipe entre engines
+                          // por completo (util para modulos con controles
+                          // finos, como Voices). Va junto al candado porque
+                          // es un bloqueo muy parecido en espiritu.
+                          GestureDetector(
+                            onTap: () => setState(
+                              () => manualSwipeLock = !manualSwipeLock,
+                            ),
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 200),
+                              width: 34,
+                              height: 34,
+                              decoration: BoxDecoration(
+                                color: manualSwipeLock
+                                    ? activeColor.withOpacity(0.15)
+                                    : const Color(0xFF1A1A1D),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: manualSwipeLock
+                                      ? activeColor
+                                      : Colors.white12,
+                                  width: 1.5,
+                                ),
+                              ),
+                              child: Icon(
+                                manualSwipeLock
+                                    ? Icons.push_pin_rounded
+                                    : Icons.push_pin_outlined,
+                                size: 15,
+                                color: manualSwipeLock
+                                    ? activeColor
+                                    : Colors.white38,
+                              ),
                             ),
                           ),
-                          child: Icon(
-                            engineLocked ? Icons.lock : Icons.lock_open,
-                            size: 16,
-                            color: engineLocked ? activeColor : Colors.white38,
+                          const SizedBox(width: 8),
+                          GestureDetector(
+                            onTap: () =>
+                                setState(() => engineLocked = !engineLocked),
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 200),
+                              width: 34,
+                              height: 34,
+                              decoration: BoxDecoration(
+                                color: engineLocked
+                                    ? activeColor.withOpacity(0.15)
+                                    : const Color(0xFF1A1A1D),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: engineLocked
+                                      ? activeColor
+                                      : Colors.white12,
+                                  width: 1.5,
+                                ),
+                              ),
+                              child: Icon(
+                                engineLocked ? Icons.lock : Icons.lock_open,
+                                size: 16,
+                                color: engineLocked
+                                    ? activeColor
+                                    : Colors.white38,
+                              ),
+                            ),
                           ),
-                        ),
+                        ],
                       ),
                     ),
                   ],
