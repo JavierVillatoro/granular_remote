@@ -64,7 +64,6 @@ class _RemoteScreenState extends State<RemoteScreen> {
   bool engineLocked = false;
   // Menu de modulos: alternativa a arrastrar, para saltar directo a un engine.
   bool showModuleMenu = false;
-  static const List<String> _engineLabels = ["MIXER", "FILTRO", "GRANULAR"];
 
   // --- ESTADO POR CAPA ---
   // Cada L1-L4 recuerda su propio valor: al cambiar de capa, los controles
@@ -724,6 +723,268 @@ class _RemoteScreenState extends State<RemoteScreen> {
     );
   }
 
+  // --- WIDGET: PANEL "PITCH" (pagina 3 del panel deslizante) ---
+  // Izquierda: TRANS (grande, con lectura en semitonos debajo) y FINE.
+  // Derecha: 4 botones para PITCH_SCALE (los 4 modos de cuantizacion de
+  // GranularVoice.cpp: Libre, Octavas, Quintas, Semitonos).
+  Widget buildPitchPanel(BuildContext context) {
+    void sendPitch(String suffix, Map<String, double> store, double val) {
+      setState(() => store[selectedLayer] = val);
+      sendOscMessage('/${selectedLayer}_$suffix', val);
+    }
+
+    // PITCH_TRANS: normalizado 0-1 -> rango real -24..+24 semitonos.
+    final transNorm = pitchTransValues[selectedLayer]!;
+    final semitones = (transNorm * 48.0 - 24.0).round();
+    final semitoneLabel = semitones == 0
+        ? "0 ST"
+        : (semitones > 0 ? "+$semitones ST" : "$semitones ST");
+
+    const scaleOptions = [
+      (label: "FREE", sub: "continuo"),
+      (label: "OCT", sub: "12 st"),
+      (label: "5TH", sub: "7 st"),
+      (label: "SEMI", sub: "1 st"),
+    ];
+    final scaleIndex = (pitchScaleValues[selectedLayer]! * 3.0).round().clamp(
+      0,
+      3,
+    );
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        // COLUMNA IZQUIERDA: TRANS (grande) + lectura en semitonos + FINE
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              RotaryKnob(
+                label: "TRANS",
+                value: transNorm,
+                color: activeColor,
+                size: 96,
+                resetValue: 0.5,
+                onChanged: (val) =>
+                    sendPitch("PITCH_TRANS", pitchTransValues, val),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                semitoneLabel,
+                style: TextStyle(
+                  fontFamily: 'monospace',
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                  letterSpacing: 1,
+                  color: activeColor,
+                ),
+              ),
+              const SizedBox(height: 26),
+              RotaryKnob(
+                label: "FINE",
+                value: pitchFineValues[selectedLayer]!,
+                color: activeColor,
+                size: 64,
+                resetValue: 0.5,
+                onChanged: (val) =>
+                    sendPitch("PITCH_FINE", pitchFineValues, val),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 20),
+        // COLUMNA DERECHA: 4 botones de SCALE (cuantizacion en semitonos)
+        Expanded(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: List.generate(scaleOptions.length, (i) {
+              final isActive = scaleIndex == i;
+              final option = scaleOptions[i];
+              return Padding(
+                padding: EdgeInsets.only(
+                  bottom: i == scaleOptions.length - 1 ? 0 : 10,
+                ),
+                child: GestureDetector(
+                  onTap: () =>
+                      sendPitch("PITCH_SCALE", pitchScaleValues, i / 3.0),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? activeColor.withOpacity(0.18)
+                          : const Color(0xFF1A1A1D),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: isActive ? activeColor : Colors.white12,
+                        width: isActive ? 1.5 : 1,
+                      ),
+                      boxShadow: isActive
+                          ? [
+                              BoxShadow(
+                                color: activeColor.withOpacity(0.35),
+                                blurRadius: 12,
+                                spreadRadius: 1,
+                              ),
+                            ]
+                          : [],
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          option.label,
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12,
+                            letterSpacing: 1.2,
+                            color: isActive ? activeColor : Colors.white54,
+                          ),
+                        ),
+                        Text(
+                          option.sub,
+                          style: TextStyle(
+                            fontSize: 9,
+                            color: isActive
+                                ? activeColor.withOpacity(0.7)
+                                : Colors.white24,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // El PageView normal de los 4 engines, con la transicion de tamano/opacidad
+  // entre paginas. Extraido a su propio metodo para poder alternarlo con el
+  // menu de modulos dentro del mismo AnimatedSwitcher/recuadro.
+  Widget _buildEnginePageView() {
+    return PageView.builder(
+      key: const ValueKey('enginePageView'),
+      controller: enginePageController,
+      // Se bloquea mientras se arrastra un puntito del filtro, la curva de
+      // EQ o la ventana de grano, para que no compitan por el mismo gesto.
+      physics: lockPageSwipe ? const NeverScrollableScrollPhysics() : null,
+      onPageChanged: (page) => setState(() => currentEnginePage = page),
+      itemCount: 4,
+      itemBuilder: (context, index) {
+        final page = switch (index) {
+          0 => buildMixerPanel(context),
+          1 => buildFilterPanel(context),
+          2 => buildEnginePanel(context),
+          _ => buildPitchPanel(context),
+        };
+        return AnimatedBuilder(
+          animation: enginePageController,
+          builder: (context, child) {
+            double current = currentEnginePage.toDouble();
+            if (enginePageController.hasClients &&
+                enginePageController.page != null) {
+              current = enginePageController.page!;
+            }
+            final distance = (current - index).abs().clamp(0.0, 1.0);
+            final scale = 1.0 - (distance * 0.12);
+            final fade = 1.0 - (distance * 0.5);
+            return Opacity(
+              opacity: fade,
+              child: Transform.scale(scale: scale, child: child),
+            );
+          },
+          // Con el candado puesto, esta pagina no responde a toques
+          // (sliders/knobs/puntitos), pero el PageView que la contiene sigue
+          // recibiendo el swipe normal.
+          child: AbsorbPointer(absorbing: engineLocked, child: page),
+        );
+      },
+    );
+  }
+
+  // Menu de modulos: sustituye al PageView DENTRO del mismo recuadro (no un
+  // popup aparte), retro-futurista, con las opciones siempre iluminadas del
+  // color de la capa activa. Tocar una opcion vuelve a la pantalla de
+  // engines ya en ese modulo.
+  Widget buildModuleMenuOverlay(BuildContext context) {
+    const items = [
+      (label: "MIXER", icon: Icons.tune_rounded),
+      (label: "FILTER", icon: Icons.show_chart_rounded),
+      (label: "GRANULAR", icon: Icons.grain_rounded),
+      (label: "PITCH", icon: Icons.piano_rounded),
+    ];
+
+    return Column(
+      key: const ValueKey('moduleMenu'),
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(items.length, (i) {
+        final isActive = currentEnginePage == i;
+        final item = items[i];
+        return Padding(
+          padding: EdgeInsets.only(bottom: i == items.length - 1 ? 0 : 14),
+          child: GestureDetector(
+            onTap: () {
+              enginePageController.jumpToPage(i);
+              setState(() {
+                currentEnginePage = i;
+                showModuleMenu = false;
+              });
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 200),
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                color: isActive
+                    ? activeColor.withOpacity(0.15)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: activeColor.withOpacity(isActive ? 0.9 : 0.35),
+                  width: isActive ? 1.5 : 1,
+                ),
+                boxShadow: isActive
+                    ? [
+                        BoxShadow(
+                          color: activeColor.withOpacity(0.4),
+                          blurRadius: 16,
+                          spreadRadius: 1,
+                        ),
+                      ]
+                    : [],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    item.icon,
+                    size: 18,
+                    color: activeColor.withOpacity(isActive ? 1.0 : 0.6),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    item.label,
+                    style: TextStyle(
+                      letterSpacing: 3,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                      color: activeColor.withOpacity(isActive ? 1.0 : 0.6),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -855,57 +1116,14 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         ),
                       ],
                     ),
-                    // PageView.builder + AnimatedBuilder: la pagina que se va
-                    // encoge y la que entra crece, para que los bordes de los
-                    // dos dibujos (EQ/filtro) no se solapen feo a medio swipe.
-                    child: PageView.builder(
-                      controller: enginePageController,
-                      // Se bloquea mientras se arrastra un puntito del filtro
-                      // o de la curva de EQ, para que no compitan por el mismo
-                      // gesto.
-                      physics: lockPageSwipe
-                          ? const NeverScrollableScrollPhysics()
-                          : null,
-                      onPageChanged: (page) =>
-                          setState(() => currentEnginePage = page),
-                      itemCount: 3,
-                      itemBuilder: (context, index) {
-                        final page = switch (index) {
-                          0 => buildMixerPanel(context),
-                          1 => buildFilterPanel(context),
-                          _ => buildEnginePanel(context),
-                        };
-                        return AnimatedBuilder(
-                          animation: enginePageController,
-                          builder: (context, child) {
-                            double current = currentEnginePage.toDouble();
-                            if (enginePageController.hasClients &&
-                                enginePageController.page != null) {
-                              current = enginePageController.page!;
-                            }
-                            final distance = (current - index).abs().clamp(
-                              0.0,
-                              1.0,
-                            );
-                            final scale = 1.0 - (distance * 0.12);
-                            final fade = 1.0 - (distance * 0.5);
-                            return Opacity(
-                              opacity: fade,
-                              child: Transform.scale(
-                                scale: scale,
-                                child: child,
-                              ),
-                            );
-                          },
-                          // Con el candado puesto, esta pagina no responde a
-                          // toques (sliders/knobs/puntitos), pero el PageView
-                          // que la contiene sigue recibiendo el swipe normal.
-                          child: AbsorbPointer(
-                            absorbing: engineLocked,
-                            child: page,
-                          ),
-                        );
-                      },
+                    // AnimatedSwitcher: el propio recuadro alterna entre el
+                    // PageView normal y el menu de modulos (elegante, sin
+                    // abrir un popup aparte fuera de la caja).
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      child: showModuleMenu
+                          ? buildModuleMenuOverlay(context)
+                          : _buildEnginePageView(),
                     ),
                   ),
                 ),
@@ -916,7 +1134,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                   children: [
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
-                      children: List.generate(3, (i) {
+                      children: List.generate(4, (i) {
                         final isActive = currentEnginePage == i;
                         return AnimatedContainer(
                           duration: const Duration(milliseconds: 250),
@@ -993,54 +1211,6 @@ class _RemoteScreenState extends State<RemoteScreen> {
                     ),
                   ],
                 ),
-                // MENU DESPLEGABLE DE MODULOS: alternativa a arrastrar, salta
-                // directo al Mixer/Filtro/Granular.
-                if (showModuleMenu)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: List.generate(_engineLabels.length, (i) {
-                        final isActive = currentEnginePage == i;
-                        return GestureDetector(
-                          onTap: () {
-                            enginePageController.animateToPage(
-                              i,
-                              duration: const Duration(milliseconds: 350),
-                              curve: Curves.easeOutCubic,
-                            );
-                            setState(() => showModuleMenu = false);
-                          },
-                          child: Container(
-                            margin: const EdgeInsets.symmetric(horizontal: 4),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 8,
-                            ),
-                            decoration: BoxDecoration(
-                              color: isActive
-                                  ? activeColor.withOpacity(0.15)
-                                  : const Color(0xFF1A1A1D),
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(
-                                color: isActive ? activeColor : Colors.white12,
-                              ),
-                            ),
-                            child: Text(
-                              _engineLabels[i],
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                                letterSpacing: 1,
-                                color: isActive ? activeColor : Colors.white54,
-                              ),
-                            ),
-                          ),
-                        );
-                      }),
-                    ),
-                  ),
-
                 // Separa la caja deslizante + puntos del boton de REC de abajo.
                 const SizedBox(height: 36),
 

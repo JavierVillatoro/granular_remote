@@ -83,8 +83,8 @@ class _GrainWindowState extends State<GrainWindow> {
       final delta = event.localPosition - previous;
       final newPos = (widget.position + delta.dx / size.width).clamp(0.0, 1.0);
       widget.onPositionChanged(newPos);
-      // Abajo = mas "cuadrada" (mas ataque); arriba = mas curva (Hann).
-      final newShape = (widget.shape + delta.dy / size.height).clamp(0.0, 1.0);
+      // Arriba = mas "cuadrada" (mas ataque); abajo = mas curva (Hann).
+      final newShape = (widget.shape - delta.dy / size.height).clamp(0.0, 1.0);
       widget.onShapeChanged(newShape);
     }
   }
