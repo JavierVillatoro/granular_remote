@@ -9,6 +9,7 @@ import 'widgets/rotary_knob.dart';
 import 'widgets/filter_graph.dart';
 import 'widgets/eq_curve.dart';
 import 'widgets/grain_window.dart';
+import 'widgets/voice_pad.dart';
 
 void main() => runApp(const GranularRemoteApp());
 
@@ -95,6 +96,22 @@ class _RemoteScreenState extends State<RemoteScreen> {
   final Map<String, double> pitchFineValues = {for (var l in _layers) l: 0.5};
   final Map<String, double> pitchScaleValues = {for (var l in _layers) l: 0.0};
 
+  // --- ESTADO DEL ENGINE VOICES (5to engine) ---
+  // 4 "voces" (igual que los 4 monjes/FxFormantModule del synth), cada una
+  // con X, Y (posicion en el pad de formante) y Mix (cuanto se aplica).
+  final List<Map<String, double>> voiceX = List.generate(
+    4,
+    (_) => {for (var l in _layers) l: 0.5},
+  );
+  final List<Map<String, double>> voiceY = List.generate(
+    4,
+    (_) => {for (var l in _layers) l: 0.5},
+  );
+  final List<Map<String, double>> voiceMix = List.generate(
+    4,
+    (_) => {for (var l in _layers) l: 0.0},
+  );
+
   // Tabla de despacho: sufijo de la direccion OSC -> mapa de estado al que
   // pertenece. Se usa tanto para el receptor en vivo (Feature de sync) como
   // referencia de que direcciones existen; PLAY se trata aparte por ser bool.
@@ -120,6 +137,9 @@ class _RemoteScreenState extends State<RemoteScreen> {
     'PITCH_TRANS': pitchTransValues,
     'PITCH_FINE': pitchFineValues,
     'PITCH_SCALE': pitchScaleValues,
+    for (var i = 0; i < 4; i++) 'M${i + 1}_X': voiceX[i],
+    for (var i = 0; i < 4; i++) 'M${i + 1}_Y': voiceY[i],
+    for (var i = 0; i < 4; i++) 'M${i + 1}_MIX': voiceMix[i],
   };
 
   RawDatagramSocket? _receiveSocket;
@@ -863,9 +883,50 @@ class _RemoteScreenState extends State<RemoteScreen> {
     );
   }
 
-  // El PageView normal de los 4 engines, con la transicion de tamano/opacidad
-  // entre paginas. Extraido a su propio metodo para poder alternarlo con el
-  // menu de modulos dentro del mismo AnimatedSwitcher/recuadro.
+  // --- WIDGET: PANEL "VOICES" (pagina 4 del panel deslizante) ---
+  // 4 cuadrados tipo XYPad (uno por "voz", igual que los 4 monjes de
+  // FxFormantModule.cpp), cada uno con su barra de Mix horizontal debajo.
+  Widget buildVoicesPanel(BuildContext context) {
+    void sendVoice(
+      int voiceIndex,
+      String suffix,
+      List<Map<String, double>> store,
+      double val,
+    ) {
+      setState(() => store[voiceIndex][selectedLayer] = val);
+      sendOscMessage('/${selectedLayer}_M${voiceIndex + 1}_$suffix', val);
+    }
+
+    Widget pad(int i) {
+      return Expanded(
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: VoicePad(
+            label: "V${i + 1}",
+            x: voiceX[i][selectedLayer]!,
+            y: voiceY[i][selectedLayer]!,
+            mix: voiceMix[i][selectedLayer]!,
+            color: activeColor,
+            onXChanged: (val) => sendVoice(i, "X", voiceX, val),
+            onYChanged: (val) => sendVoice(i, "Y", voiceY, val),
+            onMixChanged: (val) => sendVoice(i, "MIX", voiceMix, val),
+            onDragActiveChanged: setDragLock,
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        Expanded(child: Row(children: [pad(0), pad(1)])),
+        Expanded(child: Row(children: [pad(2), pad(3)])),
+      ],
+    );
+  }
+
+  // El PageView normal de los 5 engines, con la transicion de tamano/opacidad
+  // entre paginas. Extraido a su propio metodo para poder superponerlo con
+  // el menu de modulos dentro del mismo recuadro (ver build()).
   Widget _buildEnginePageView() {
     return PageView.builder(
       key: const ValueKey('enginePageView'),
@@ -874,13 +935,14 @@ class _RemoteScreenState extends State<RemoteScreen> {
       // EQ o la ventana de grano, para que no compitan por el mismo gesto.
       physics: lockPageSwipe ? const NeverScrollableScrollPhysics() : null,
       onPageChanged: (page) => setState(() => currentEnginePage = page),
-      itemCount: 4,
+      itemCount: 5,
       itemBuilder: (context, index) {
         final page = switch (index) {
           0 => buildMixerPanel(context),
           1 => buildFilterPanel(context),
           2 => buildEnginePanel(context),
-          _ => buildPitchPanel(context),
+          3 => buildPitchPanel(context),
+          _ => buildVoicesPanel(context),
         };
         return AnimatedBuilder(
           animation: enginePageController,
@@ -917,6 +979,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
       (label: "FILTER", icon: Icons.show_chart_rounded),
       (label: "GRANULAR", icon: Icons.grain_rounded),
       (label: "PITCH", icon: Icons.piano_rounded),
+      (label: "VOICES", icon: Icons.record_voice_over_rounded),
     ];
 
     return Column(
@@ -1116,14 +1179,31 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         ),
                       ],
                     ),
-                    // AnimatedSwitcher: el propio recuadro alterna entre el
-                    // PageView normal y el menu de modulos (elegante, sin
-                    // abrir un popup aparte fuera de la caja).
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 220),
-                      child: showModuleMenu
-                          ? buildModuleMenuOverlay(context)
-                          : _buildEnginePageView(),
+                    // El PageView se queda SIEMPRE montado (el menu solo se
+                    // superpone encima con un fundido): si se desmontara al
+                    // abrir el menu, su PageController se queda sin cliente
+                    // y jumpToPage() al elegir un modulo no hacia nada (por
+                    // eso los botones del menu no respondian).
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(23),
+                      child: Stack(
+                        children: [
+                          Positioned.fill(child: _buildEnginePageView()),
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              ignoring: !showModuleMenu,
+                              child: AnimatedOpacity(
+                                duration: const Duration(milliseconds: 200),
+                                opacity: showModuleMenu ? 1.0 : 0.0,
+                                child: Container(
+                                  color: const Color(0xFF16161A),
+                                  child: buildModuleMenuOverlay(context),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
@@ -1134,7 +1214,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                   children: [
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
-                      children: List.generate(4, (i) {
+                      children: List.generate(5, (i) {
                         final isActive = currentEnginePage == i;
                         return AnimatedContainer(
                           duration: const Duration(milliseconds: 250),
