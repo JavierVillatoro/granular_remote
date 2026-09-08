@@ -39,8 +39,12 @@ class EqCurve extends StatefulWidget {
 }
 
 class _EqCurveState extends State<EqCurve> {
-  // -1 = ninguno, 0..3 = banda (Low, Mid-L, Mid-H, High)
-  int _draggedBand = -1;
+  // pointerId -> que banda arrastra (0..3). Un Map en vez de un solo int
+  // permite mover 2 bandas a la vez con 2 dedos.
+  final Map<int, int> _pointerToBand = {};
+  // Para detectar doble-toque a mano (Listener no trae deteccion de gestos),
+  // guardado por banda (no por dedo).
+  final Map<int, DateTime> _lastDownTimeByBand = {};
 
   static const List<double> _xFractions = [0.125, 0.375, 0.625, 0.875];
 
@@ -60,23 +64,54 @@ class _EqCurveState extends State<EqCurve> {
     });
   }
 
-  void _onDown(Offset pos, Size size) {
+  void _resetBand(int i) {
+    switch (i) {
+      case 0:
+        widget.onLowChanged(0.5);
+        break;
+      case 1:
+        widget.onMidLowChanged(0.5);
+        break;
+      case 2:
+        widget.onMidHighChanged(0.5);
+        break;
+      case 3:
+        widget.onHighChanged(0.5);
+        break;
+    }
+  }
+
+  void _onDown(PointerDownEvent event, Size size) {
+    final pos = event.localPosition;
     final dots = _dotPositions(size);
     const hitRadius = 28.0;
     for (int i = 0; i < dots.length; i++) {
-      if ((pos - dots[i]).distance < hitRadius) {
-        _draggedBand = i;
-        widget.onDragActiveChanged?.call(true);
+      if ((pos - dots[i]).distance >= hitRadius) continue;
+      if (_pointerToBand.containsValue(i)) continue; // ya la arrastra otro dedo
+
+      final now = DateTime.now();
+      final lastDown = _lastDownTimeByBand[i];
+      final isDoubleTap =
+          lastDown != null &&
+          now.difference(lastDown) < const Duration(milliseconds: 300);
+      _lastDownTimeByBand[i] = now;
+      if (isDoubleTap) {
+        _lastDownTimeByBand.remove(i);
+        _resetBand(i);
         return;
       }
+
+      _pointerToBand[event.pointer] = i;
+      widget.onDragActiveChanged?.call(true);
+      return;
     }
-    _draggedBand = -1;
   }
 
-  void _onMove(Offset pos, Size size) {
-    if (_draggedBand == -1) return;
-    final newVal = 1.0 - (pos.dy / size.height).clamp(0.0, 1.0);
-    switch (_draggedBand) {
+  void _onMove(PointerMoveEvent event, Size size) {
+    final band = _pointerToBand[event.pointer];
+    if (band == null) return;
+    final newVal = 1.0 - (event.localPosition.dy / size.height).clamp(0.0, 1.0);
+    switch (band) {
       case 0:
         widget.onLowChanged(newVal);
         break;
@@ -92,10 +127,9 @@ class _EqCurveState extends State<EqCurve> {
     }
   }
 
-  void _onUp() {
-    if (_draggedBand == -1) return;
-    _draggedBand = -1;
-    widget.onDragActiveChanged?.call(false);
+  void _onUp(PointerEvent event) {
+    if (_pointerToBand.remove(event.pointer) == null) return;
+    if (_pointerToBand.isEmpty) widget.onDragActiveChanged?.call(false);
   }
 
   @override
@@ -104,10 +138,10 @@ class _EqCurveState extends State<EqCurve> {
       builder: (context, constraints) {
         final size = Size(constraints.maxWidth, constraints.maxHeight);
         return Listener(
-          onPointerDown: (d) => _onDown(d.localPosition, size),
-          onPointerMove: (d) => setState(() => _onMove(d.localPosition, size)),
-          onPointerUp: (_) => setState(_onUp),
-          onPointerCancel: (_) => setState(_onUp),
+          onPointerDown: (d) => _onDown(d, size),
+          onPointerMove: (d) => setState(() => _onMove(d, size)),
+          onPointerUp: (d) => setState(() => _onUp(d)),
+          onPointerCancel: (d) => setState(() => _onUp(d)),
           child: CustomPaint(
             size: size,
             painter: _EqCurvePainter(values: _values, color: widget.color),
@@ -131,9 +165,13 @@ class _EqCurvePainter extends CustomPainter {
     return hsl.withLightness((hsl.lightness + 0.2).clamp(0.0, 1.0)).toColor();
   }
 
-  // Catmull-Rom -> Bezier: curva suave que pasa por los 4 puntos exactamente.
-  Path _smoothPathThrough(List<Offset> pts) {
-    final path = Path()..moveTo(pts.first.dx, pts.first.dy);
+  // Catmull-Rom -> Bezier: anade la curva suave que pasa por los 4 puntos
+  // directamente al "path" recibido (que ya debe estar posicionado en
+  // pts.first), en vez de crear un Path nuevo con su propio moveTo.
+  // path.addPath() crea un contorno/PathMetric SEPARADO (no conectado), lo
+  // que dejaba un hueco de muestreo justo en la costura al rellenar la curva
+  // (el "platito" sin rellenar junto al primer punto blanco).
+  void _addSmoothCubics(Path path, List<Offset> pts) {
     final before = pts[0] * 2 - pts[1];
     final after = pts[3] * 2 - pts[2];
     final ext = [before, ...pts, after];
@@ -147,7 +185,6 @@ class _EqCurvePainter extends CustomPainter {
       final cp2 = p2 - (p3 - p1) / 6.0;
       path.cubicTo(cp1.dx, cp1.dy, cp2.dx, cp2.dy, p2.dx, p2.dy);
     }
-    return path;
   }
 
   @override
@@ -180,11 +217,13 @@ class _EqCurvePainter extends CustomPainter {
     });
 
     // La curva ocupa todo el ancho: tramo recto hasta la 1a banda, curva
-    // suave entre las 4 bandas, tramo recto desde la ultima banda.
+    // suave entre las 4 bandas, tramo recto desde la ultima banda. Todo en
+    // un unico contorno continuo (sin addPath) para que el muestreo de mas
+    // abajo no tenga costuras.
     final curve = Path()
       ..moveTo(0, dots.first.dy)
       ..lineTo(dots.first.dx, dots.first.dy);
-    curve.addPath(_smoothPathThrough(dots), Offset.zero);
+    _addSmoothCubics(curve, dots);
     curve.lineTo(size.width, dots.last.dy);
 
     // Relleno entre la curva y la linea central (retro EQ look).
@@ -199,23 +238,37 @@ class _EqCurvePainter extends CustomPainter {
     Offset? previous;
     for (final metric in curve.computeMetrics()) {
       const step = 4.0;
-      for (double d = 0; d <= metric.length; d += step) {
+      double d = 0;
+      while (d < metric.length) {
         final tangent = metric.getTangentForOffset(d);
-        if (tangent == null) continue;
-        final point = tangent.position;
-        if (previous != null) {
-          final quad = Path()
-            ..moveTo(previous.dx, previous.dy)
-            ..lineTo(point.dx, point.dy)
-            ..lineTo(point.dx, centerY)
-            ..lineTo(previous.dx, centerY)
-            ..close();
-          canvas.drawPath(quad, fillPaint);
+        if (tangent != null) {
+          final point = tangent.position;
+          if (previous != null) {
+            final quad = Path()
+              ..moveTo(previous.dx, previous.dy)
+              ..lineTo(point.dx, point.dy)
+              ..lineTo(point.dx, centerY)
+              ..lineTo(previous.dx, centerY)
+              ..close();
+            canvas.drawPath(quad, fillPaint);
+          }
+          previous = point;
         }
-        previous = point;
+        d += step;
       }
-      previous =
-          null; // no unir tramos de distintos metrics (aqui hay uno solo)
+      // Tramo final hasta el propio extremo del contorno (si "length" no es
+      // multiplo exacto de "step", sin esto se pierde el ultimo trocito).
+      final endTangent = metric.getTangentForOffset(metric.length);
+      if (endTangent != null && previous != null) {
+        final point = endTangent.position;
+        final quad = Path()
+          ..moveTo(previous.dx, previous.dy)
+          ..lineTo(point.dx, point.dy)
+          ..lineTo(point.dx, centerY)
+          ..lineTo(previous.dx, centerY)
+          ..close();
+        canvas.drawPath(quad, fillPaint);
+      }
     }
     canvas.drawPath(
       curve,

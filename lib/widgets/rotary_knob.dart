@@ -9,6 +9,9 @@ class RotaryKnob extends StatelessWidget {
   final Color color;
   final String label;
   final double size;
+  // Doble toque para volver a este valor de un golpe. Si es null, el doble
+  // toque no hace nada (se usa asi en los puntitos blancos del filtro/EQ).
+  final double? resetValue;
 
   const RotaryKnob({
     super.key,
@@ -17,6 +20,7 @@ class RotaryKnob extends StatelessWidget {
     required this.color,
     required this.label,
     this.size = 56,
+    this.resetValue,
   });
 
   @override
@@ -30,6 +34,7 @@ class RotaryKnob extends StatelessWidget {
             final next = (value - details.delta.dy / 150.0).clamp(0.0, 1.0);
             onChanged(next);
           },
+          onDoubleTap: resetValue == null ? null : () => onChanged(resetValue!),
           child: SizedBox(
             width: size,
             height: size,

@@ -43,8 +43,12 @@ class FilterGraph extends StatefulWidget {
 }
 
 class _FilterGraphState extends State<FilterGraph> {
-  // -1 = ninguno, 0 = punto HPF, 1 = punto LPF (igual que draggedDot en FilterModule.cpp)
-  int _draggedDot = -1;
+  // pointerId -> que punto arrastra (0 = HPF, 1 = LPF). Un Map en vez de un
+  // solo int permite mover los 2 puntos a la vez con 2 dedos.
+  final Map<int, int> _pointerToDot = {};
+  // Para detectar doble-toque a mano (Listener no trae deteccion de gestos),
+  // guardado por punto (no por dedo: un doble toque son 2 toques distintos).
+  final Map<int, DateTime> _lastDownTimeByDot = {};
 
   double _dotY(double resNorm, double height) {
     final qVal = 0.707 + (2.5 - 0.707) * resNorm;
@@ -63,7 +67,8 @@ class _FilterGraphState extends State<FilterGraph> {
     return outMin + (outMax - outMin) * ((v - inMin) / (inMax - inMin));
   }
 
-  void _onDown(Offset pos, Size size) {
+  void _onDown(PointerDownEvent event, Size size) {
+    final pos = event.localPosition;
     final hpfDot = Offset(
       widget.hpf * size.width,
       _dotY(widget.resHpf, size.height),
@@ -75,26 +80,51 @@ class _FilterGraphState extends State<FilterGraph> {
 
     const hitRadius =
         28.0; // mas generoso que en JUCE: aqui se toca con el dedo, no con el raton
-    if ((pos - hpfDot).distance < hitRadius) {
-      _draggedDot = 0;
-    } else if ((pos - lpfDot).distance < hitRadius) {
-      _draggedDot = 1;
-    } else {
-      _draggedDot = -1;
-      return; // no hemos tocado ningun punto: dejamos el gesto libre para el swipe
+    int? hit;
+    if ((pos - hpfDot).distance < hitRadius &&
+        !_pointerToDot.containsValue(0)) {
+      hit = 0;
+    } else if ((pos - lpfDot).distance < hitRadius &&
+        !_pointerToDot.containsValue(1)) {
+      hit = 1;
     }
+    if (hit == null) {
+      return; // no hemos tocado ningun punto libre: dejamos el gesto para el swipe
+    }
+
+    final now = DateTime.now();
+    final lastDown = _lastDownTimeByDot[hit];
+    final isDoubleTap =
+        lastDown != null &&
+        now.difference(lastDown) < const Duration(milliseconds: 300);
+    _lastDownTimeByDot[hit] = now;
+    if (isDoubleTap) {
+      _lastDownTimeByDot.remove(hit);
+      if (hit == 0) {
+        widget.onHpfChanged(0.0);
+        widget.onResHpfChanged(0.0);
+      } else {
+        widget.onLpfChanged(1.0);
+        widget.onResLpfChanged(0.0);
+      }
+      return;
+    }
+
+    _pointerToDot[event.pointer] = hit;
     widget.onDragActiveChanged?.call(true);
   }
 
-  void _onMove(Offset pos, Size size) {
-    if (_draggedDot == -1) return;
+  void _onMove(PointerMoveEvent event, Size size) {
+    final dot = _pointerToDot[event.pointer];
+    if (dot == null) return;
 
+    final pos = event.localPosition;
     final px = (pos.dx / size.width).clamp(0.0, 1.0);
     final py = (pos.dy / size.height).clamp(0.0, 1.0);
     final newFreqNorm = px;
     final newResNorm = 1.0 - py;
 
-    if (_draggedDot == 0) {
+    if (dot == 0) {
       widget.onHpfChanged(newFreqNorm);
       widget.onResHpfChanged(newResNorm);
     } else {
@@ -103,10 +133,9 @@ class _FilterGraphState extends State<FilterGraph> {
     }
   }
 
-  void _onUp() {
-    if (_draggedDot == -1) return;
-    _draggedDot = -1;
-    widget.onDragActiveChanged?.call(false);
+  void _onUp(PointerEvent event) {
+    if (_pointerToDot.remove(event.pointer) == null) return;
+    if (_pointerToDot.isEmpty) widget.onDragActiveChanged?.call(false);
   }
 
   @override
@@ -118,12 +147,13 @@ class _FilterGraphState extends State<FilterGraph> {
         // asi no entra en la "arena de gestos" del PageView que envuelve este
         // panel, y podemos decidir nosotros mismos, en el propio pointer-down,
         // si el toque es sobre un punto (lo capturamos) o no (dejamos que el
-        // PageView reciba el swipe con normalidad).
+        // PageView reciba el swipe con normalidad). Ademas soporta 2 dedos a
+        // la vez (uno por punto).
         return Listener(
-          onPointerDown: (d) => _onDown(d.localPosition, size),
-          onPointerMove: (d) => setState(() => _onMove(d.localPosition, size)),
-          onPointerUp: (_) => setState(_onUp),
-          onPointerCancel: (_) => setState(_onUp),
+          onPointerDown: (d) => _onDown(d, size),
+          onPointerMove: (d) => setState(() => _onMove(d, size)),
+          onPointerUp: (d) => setState(() => _onUp(d)),
+          onPointerCancel: (d) => setState(() => _onUp(d)),
           child: CustomPaint(
             size: size,
             painter: _FilterGraphPainter(

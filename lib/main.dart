@@ -8,6 +8,7 @@ import 'dart:io';
 import 'widgets/rotary_knob.dart';
 import 'widgets/filter_graph.dart';
 import 'widgets/eq_curve.dart';
+import 'widgets/grain_window.dart';
 
 void main() => runApp(const GranularRemoteApp());
 
@@ -61,6 +62,9 @@ class _RemoteScreenState extends State<RemoteScreen> {
   // riesgo de tocar un parametro por error. El swipe entre paginas sigue
   // funcionando siempre, solo se bloquean los controles de dentro.
   bool engineLocked = false;
+  // Menu de modulos: alternativa a arrastrar, para saltar directo a un engine.
+  bool showModuleMenu = false;
+  static const List<String> _engineLabels = ["MIXER", "FILTRO", "GRANULAR"];
 
   // --- ESTADO POR CAPA ---
   // Cada L1-L4 recuerda su propio valor: al cambiar de capa, los controles
@@ -75,6 +79,114 @@ class _RemoteScreenState extends State<RemoteScreen> {
   final Map<String, double> eqMidHighValues = {for (var l in _layers) l: 0.5};
   final Map<String, double> eqHighValues = {for (var l in _layers) l: 0.5};
   final Map<String, double> volValues = {for (var l in _layers) l: 0.75};
+
+  // --- ESTADO DEL ENGINE GRANULAR (tercer engine) ---
+  // 3 de los 12 se controlan solo desde GrainWindow (ventana de grano):
+  final Map<String, double> positionValues = {for (var l in _layers) l: 0.5};
+  final Map<String, double> grainSizeValues = {for (var l in _layers) l: 0.5};
+  final Map<String, double> shapeValues = {for (var l in _layers) l: 0.0};
+  // Los otros 9 son la rejilla de knobs 3x3:
+  final Map<String, double> densityValues = {for (var l in _layers) l: 0.4};
+  final Map<String, double> scanSpeedValues = {for (var l in _layers) l: 0.5};
+  final Map<String, double> scanModeValues = {for (var l in _layers) l: 0.0};
+  final Map<String, double> sprayPosValues = {for (var l in _layers) l: 0.0};
+  final Map<String, double> sprayPitchValues = {for (var l in _layers) l: 0.0};
+  final Map<String, double> sprayPanValues = {for (var l in _layers) l: 0.0};
+  final Map<String, double> pitchTransValues = {for (var l in _layers) l: 0.5};
+  final Map<String, double> pitchFineValues = {for (var l in _layers) l: 0.5};
+  final Map<String, double> pitchScaleValues = {for (var l in _layers) l: 0.0};
+
+  // Tabla de despacho: sufijo de la direccion OSC -> mapa de estado al que
+  // pertenece. Se usa tanto para el receptor en vivo (Feature de sync) como
+  // referencia de que direcciones existen; PLAY se trata aparte por ser bool.
+  late final Map<String, Map<String, double>> _oscDispatch = {
+    'FILTER_LPF': filterValues,
+    'FILTER_HPF': hpfValues,
+    'FILTER_RES_LPF': resLpfValues,
+    'FILTER_RES_HPF': resHpfValues,
+    'EQ_LOW': eqLowValues,
+    'EQ_MID_LOW': eqMidLowValues,
+    'EQ_MID_HIGH': eqMidHighValues,
+    'EQ_HIGH': eqHighValues,
+    'MIX_VOL': volValues,
+    'POSITION': positionValues,
+    'GRAIN_SIZE': grainSizeValues,
+    'SHAPE': shapeValues,
+    'DENSITY': densityValues,
+    'SCAN_SPEED': scanSpeedValues,
+    'SCAN_MODE': scanModeValues,
+    'SPRAY_POS': sprayPosValues,
+    'SPRAY_PITCH': sprayPitchValues,
+    'SPRAY_PAN': sprayPanValues,
+    'PITCH_TRANS': pitchTransValues,
+    'PITCH_FINE': pitchFineValues,
+    'PITCH_SCALE': pitchScaleValues,
+  };
+
+  RawDatagramSocket? _receiveSocket;
+  static const int _receivePort = 9001;
+  static final RegExp _layerAddressPattern = RegExp(r'^/?(L[1-4])_(.+)$');
+
+  @override
+  void initState() {
+    super.initState();
+    _startOscReceiver();
+  }
+
+  @override
+  void dispose() {
+    _receiveSocket?.close();
+    super.dispose();
+  }
+
+  // --- RECEPTOR OSC: sincronizacion en vivo desde el plugin ---
+  // Escucha en un puerto fijo (9001, distinto del 9000 de envio) los cambios
+  // de parametro que el plugin emite (p.ej. al cargar un preset) y actualiza
+  // el estado local. Nunca reenvia OSC al recibir, para no crear un bucle.
+  Future<void> _startOscReceiver() async {
+    try {
+      final socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        _receivePort,
+      );
+      _receiveSocket = socket;
+      socket.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        final datagram = socket.receive();
+        if (datagram == null) return;
+        try {
+          final message = OSCMessage.fromBytes(datagram.data);
+          _handleIncomingOsc(message);
+        } catch (e) {
+          print("Error OSC entrante: $e");
+        }
+      });
+    } catch (e) {
+      print("No se pudo abrir el puerto de sincronizacion $_receivePort: $e");
+    }
+  }
+
+  void _handleIncomingOsc(OSCMessage message) {
+    if (message.arguments.isEmpty) return;
+    final rawValue = message.arguments.first;
+    final value = rawValue is double
+        ? rawValue
+        : (rawValue is int ? rawValue.toDouble() : null);
+    if (value == null) return;
+
+    final match = _layerAddressPattern.firstMatch(message.address);
+    if (match == null) return;
+    final layer = match.group(1)!;
+    final suffix = match.group(2)!;
+
+    if (suffix == 'PLAY') {
+      setState(() => playStates[layer] = value > 0.5);
+      return;
+    }
+    final store = _oscDispatch[suffix];
+    if (store == null) return;
+    setState(() => store[layer] = value.clamp(0.0, 1.0));
+  }
 
   bool get isPlaying => playStates[selectedLayer]!;
   double get filterValue => filterValues[selectedLayer]!;
@@ -248,12 +360,14 @@ class _RemoteScreenState extends State<RemoteScreen> {
   }
 
   // --- WIDGET: MINI SLIDER ETIQUETADO (usado en el panel de filtro) ---
+  // Doble toque sobre el slider para volver a "resetValue" de un golpe.
   Widget buildMiniSlider(
     BuildContext context,
     String label,
     double value,
-    ValueChanged<double> onChanged,
-  ) {
+    ValueChanged<double> onChanged, {
+    required double resetValue,
+  }) {
     return Expanded(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -268,21 +382,28 @@ class _RemoteScreenState extends State<RemoteScreen> {
             ),
           ),
           const SizedBox(height: 4),
-          SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              activeTrackColor: activeColor,
-              inactiveTrackColor: Colors.white10,
-              trackHeight: 5.0,
-              thumbColor: activeColor,
-              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 9.0),
-              overlayColor: activeColor.withOpacity(0.2),
-              overlayShape: const RoundSliderOverlayShape(overlayRadius: 18.0),
-            ),
-            child: Slider(
-              value: value,
-              min: 0.0,
-              max: 1.0,
-              onChanged: onChanged,
+          GestureDetector(
+            onDoubleTap: () => onChanged(resetValue),
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                activeTrackColor: activeColor,
+                inactiveTrackColor: Colors.white10,
+                trackHeight: 5.0,
+                thumbColor: activeColor,
+                thumbShape: const RoundSliderThumbShape(
+                  enabledThumbRadius: 9.0,
+                ),
+                overlayColor: activeColor.withOpacity(0.2),
+                overlayShape: const RoundSliderOverlayShape(
+                  overlayRadius: 18.0,
+                ),
+              ),
+              child: Slider(
+                value: value,
+                min: 0.0,
+                max: 1.0,
+                onChanged: onChanged,
+              ),
             ),
           ),
         ],
@@ -308,6 +429,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
               "HIGH PASS",
               hpfValues[selectedLayer]!,
               (val) => sendFilter("FILTER_HPF", hpfValues, val),
+              resetValue: 0.0,
             ),
             const SizedBox(width: 20),
             buildMiniSlider(
@@ -315,6 +437,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
               "LOW PASS",
               filterValue,
               (val) => sendFilter("FILTER_LPF", filterValues, val),
+              resetValue: 1.0,
             ),
           ],
         ),
@@ -326,6 +449,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
               "RES HIGH",
               resHpfValues[selectedLayer]!,
               (val) => sendFilter("FILTER_RES_HPF", resHpfValues, val),
+              resetValue: 0.0,
             ),
             const SizedBox(width: 20),
             buildMiniSlider(
@@ -333,6 +457,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
               "RES LOW",
               resLpfValues[selectedLayer]!,
               (val) => sendFilter("FILTER_RES_LPF", resLpfValues, val),
+              resetValue: 0.0,
             ),
           ],
         ),
@@ -392,30 +517,33 @@ class _RemoteScreenState extends State<RemoteScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                SizedBox(
-                  height: 190,
-                  width: 44,
-                  child: RotatedBox(
-                    quarterTurns: 3,
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        activeTrackColor: activeColor,
-                        inactiveTrackColor: Colors.white10,
-                        trackHeight: 6.0,
-                        thumbColor: activeColor,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 11.0,
+                GestureDetector(
+                  onDoubleTap: () => sendEq("MIX_VOL", volValues, 0.75),
+                  child: SizedBox(
+                    height: 190,
+                    width: 44,
+                    child: RotatedBox(
+                      quarterTurns: 3,
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          activeTrackColor: activeColor,
+                          inactiveTrackColor: Colors.white10,
+                          trackHeight: 6.0,
+                          thumbColor: activeColor,
+                          thumbShape: const RoundSliderThumbShape(
+                            enabledThumbRadius: 11.0,
+                          ),
+                          overlayColor: activeColor.withOpacity(0.2),
+                          overlayShape: const RoundSliderOverlayShape(
+                            overlayRadius: 22.0,
+                          ),
                         ),
-                        overlayColor: activeColor.withOpacity(0.2),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 22.0,
+                        child: Slider(
+                          value: volValues[selectedLayer]!,
+                          min: 0.0,
+                          max: 1.0,
+                          onChanged: (val) => sendEq("MIX_VOL", volValues, val),
                         ),
-                      ),
-                      child: Slider(
-                        value: volValues[selectedLayer]!,
-                        min: 0.0,
-                        max: 1.0,
-                        onChanged: (val) => sendEq("MIX_VOL", volValues, val),
                       ),
                     ),
                   ),
@@ -436,6 +564,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         value: eqLowValues[selectedLayer]!,
                         color: activeColor,
                         size: 76,
+                        resetValue: 0.5,
                         onChanged: (val) => sendEq("EQ_LOW", eqLowValues, val),
                       ),
                       RotaryKnob(
@@ -443,6 +572,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         value: eqMidLowValues[selectedLayer]!,
                         color: activeColor,
                         size: 76,
+                        resetValue: 0.5,
                         onChanged: (val) =>
                             sendEq("EQ_MID_LOW", eqMidLowValues, val),
                       ),
@@ -457,6 +587,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         value: eqMidHighValues[selectedLayer]!,
                         color: activeColor,
                         size: 76,
+                        resetValue: 0.5,
                         onChanged: (val) =>
                             sendEq("EQ_MID_HIGH", eqMidHighValues, val),
                       ),
@@ -465,6 +596,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
                         value: eqHighValues[selectedLayer]!,
                         color: activeColor,
                         size: 76,
+                        resetValue: 0.5,
                         onChanged: (val) =>
                             sendEq("EQ_HIGH", eqHighValues, val),
                       ),
@@ -492,6 +624,99 @@ class _RemoteScreenState extends State<RemoteScreen> {
             onMidHighChanged: (val) =>
                 sendEq("EQ_MID_HIGH", eqMidHighValues, val),
             onHighChanged: (val) => sendEq("EQ_HIGH", eqHighValues, val),
+            onDragActiveChanged: setDragLock,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // --- WIDGET: PANEL "GRANULAR" (pagina 2 del panel deslizante) ---
+  // Rejilla 3x3 de knobs (9 de los 12 parametros del motor granular) + la
+  // ventana de grano debajo (Position, Grain Size y Shape, con un solo gesto).
+  Widget buildEnginePanel(BuildContext context) {
+    void sendEngine(String suffix, Map<String, double> store, double val) {
+      setState(() => store[selectedLayer] = val);
+      sendOscMessage('/${selectedLayer}_$suffix', val);
+    }
+
+    Widget knobRow(List<Widget> knobs) =>
+        Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: knobs);
+
+    // Solo 6 knobs aqui (Density, Scan, Spray): los 3 de Pitch (Trans/Fine/
+    // Scale) se quitan de este engine, tendran su propio modulo mas adelante.
+    // Con menos knobs, cada uno puede ser mas grande y queda mas espacio para
+    // la ventana de grano de abajo.
+    return Column(
+      children: [
+        knobRow([
+          RotaryKnob(
+            label: "DENSITY",
+            value: densityValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.4,
+            onChanged: (val) => sendEngine("DENSITY", densityValues, val),
+          ),
+          RotaryKnob(
+            label: "SCAN SPD",
+            value: scanSpeedValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.5,
+            onChanged: (val) => sendEngine("SCAN_SPEED", scanSpeedValues, val),
+          ),
+          RotaryKnob(
+            label: "SCAN DIR",
+            value: scanModeValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.0,
+            onChanged: (val) => sendEngine("SCAN_MODE", scanModeValues, val),
+          ),
+        ]),
+        const SizedBox(height: 18),
+        knobRow([
+          RotaryKnob(
+            label: "SPRAY POS",
+            value: sprayPosValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.0,
+            onChanged: (val) => sendEngine("SPRAY_POS", sprayPosValues, val),
+          ),
+          RotaryKnob(
+            label: "SPRAY PITCH",
+            value: sprayPitchValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.0,
+            onChanged: (val) =>
+                sendEngine("SPRAY_PITCH", sprayPitchValues, val),
+          ),
+          RotaryKnob(
+            label: "SPRAY PAN",
+            value: sprayPanValues[selectedLayer]!,
+            color: activeColor,
+            size: 72,
+            resetValue: 0.0,
+            onChanged: (val) => sendEngine("SPRAY_PAN", sprayPanValues, val),
+          ),
+        ]),
+        const SizedBox(height: 16),
+        // VENTANA DE GRANO: Position (arrastre horizontal, 1 dedo), Grain
+        // Size (pellizcar, 2 dedos) y Shape (arrastre vertical, 1 dedo).
+        Expanded(
+          child: GrainWindow(
+            position: positionValues[selectedLayer]!,
+            grainSize: grainSizeValues[selectedLayer]!,
+            shape: shapeValues[selectedLayer]!,
+            color: activeColor,
+            onPositionChanged: (val) =>
+                sendEngine("POSITION", positionValues, val),
+            onGrainSizeChanged: (val) =>
+                sendEngine("GRAIN_SIZE", grainSizeValues, val),
+            onShapeChanged: (val) => sendEngine("SHAPE", shapeValues, val),
             onDragActiveChanged: setDragLock,
           ),
         ),
@@ -643,11 +868,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
                           : null,
                       onPageChanged: (page) =>
                           setState(() => currentEnginePage = page),
-                      itemCount: 2,
+                      itemCount: 3,
                       itemBuilder: (context, index) {
-                        final page = index == 0
-                            ? buildMixerPanel(context)
-                            : buildFilterPanel(context);
+                        final page = switch (index) {
+                          0 => buildMixerPanel(context),
+                          1 => buildFilterPanel(context),
+                          _ => buildEnginePanel(context),
+                        };
                         return AnimatedBuilder(
                           animation: enginePageController,
                           builder: (context, child) {
@@ -683,13 +910,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                // PUNTOS INDICADORES DE PAGINA + BOTON DE CANDADO (a la derecha)
+                // PUNTOS INDICADORES + BOTON DE MENU (izq.) Y CANDADO (dcha.)
                 Stack(
                   alignment: Alignment.center,
                   children: [
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
-                      children: List.generate(2, (i) {
+                      children: List.generate(3, (i) {
                         final isActive = currentEnginePage == i;
                         return AnimatedContainer(
                           duration: const Duration(milliseconds: 250),
@@ -702,6 +929,38 @@ class _RemoteScreenState extends State<RemoteScreen> {
                           ),
                         );
                       }),
+                    ),
+                    // BOTON DE MENU DE MODULOS (izquierda, simetrico al candado)
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: GestureDetector(
+                        onTap: () =>
+                            setState(() => showModuleMenu = !showModuleMenu),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: showModuleMenu
+                                ? activeColor.withOpacity(0.15)
+                                : const Color(0xFF1A1A1D),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: showModuleMenu
+                                  ? activeColor
+                                  : Colors.white12,
+                              width: 1.5,
+                            ),
+                          ),
+                          child: Icon(
+                            Icons.apps_rounded,
+                            size: 16,
+                            color: showModuleMenu
+                                ? activeColor
+                                : Colors.white38,
+                          ),
+                        ),
+                      ),
                     ),
                     Align(
                       alignment: Alignment.centerRight,
@@ -734,6 +993,53 @@ class _RemoteScreenState extends State<RemoteScreen> {
                     ),
                   ],
                 ),
+                // MENU DESPLEGABLE DE MODULOS: alternativa a arrastrar, salta
+                // directo al Mixer/Filtro/Granular.
+                if (showModuleMenu)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 10),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: List.generate(_engineLabels.length, (i) {
+                        final isActive = currentEnginePage == i;
+                        return GestureDetector(
+                          onTap: () {
+                            enginePageController.animateToPage(
+                              i,
+                              duration: const Duration(milliseconds: 350),
+                              curve: Curves.easeOutCubic,
+                            );
+                            setState(() => showModuleMenu = false);
+                          },
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isActive
+                                  ? activeColor.withOpacity(0.15)
+                                  : const Color(0xFF1A1A1D),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: isActive ? activeColor : Colors.white12,
+                              ),
+                            ),
+                            child: Text(
+                              _engineLabels[i],
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1,
+                                color: isActive ? activeColor : Colors.white54,
+                              ),
+                            ),
+                          ),
+                        );
+                      }),
+                    ),
+                  ),
 
                 // Separa la caja deslizante + puntos del boton de REC de abajo.
                 const SizedBox(height: 36),
