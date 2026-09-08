@@ -7,6 +7,7 @@ import 'package:osc/osc.dart';
 import 'dart:io';
 import 'widgets/rotary_knob.dart';
 import 'widgets/filter_graph.dart';
+import 'widgets/eq_curve.dart';
 
 void main() => runApp(const GranularRemoteApp());
 
@@ -51,6 +52,15 @@ class _RemoteScreenState extends State<RemoteScreen> {
   String selectedLayer = "L1";
   bool isRecording = false;
   int currentEnginePage = 0;
+  // Mientras se arrastra un puntito del filtro o de la curva de EQ, bloqueamos
+  // el swipe del PageView para que no compitan por el mismo gesto.
+  bool lockPageSwipe = false;
+  void setDragLock(bool active) => setState(() => lockPageSwipe = active);
+  // Boton de candado: congela todos los controles de la pantalla de engines
+  // (sliders, knobs, puntitos) para poder deslizar entre Mixer/Filtro sin
+  // riesgo de tocar un parametro por error. El swipe entre paginas sigue
+  // funcionando siempre, solo se bloquean los controles de dentro.
+  bool engineLocked = false;
 
   // --- ESTADO POR CAPA ---
   // Cada L1-L4 recuerda su propio valor: al cambiar de capa, los controles
@@ -287,22 +297,24 @@ class _RemoteScreenState extends State<RemoteScreen> {
       sendOscMessage('/${selectedLayer}_$suffix', val);
     }
 
+    // Mismo orden visual que FilterModule::resized() en el synth: columna
+    // izquierda = HPF (corte arriba, resonancia abajo), columna derecha = LPF.
     return Column(
       children: [
         Row(
           children: [
             buildMiniSlider(
               context,
-              "LOW PASS",
-              filterValue,
-              (val) => sendFilter("FILTER_LPF", filterValues, val),
+              "HIGH PASS",
+              hpfValues[selectedLayer]!,
+              (val) => sendFilter("FILTER_HPF", hpfValues, val),
             ),
             const SizedBox(width: 20),
             buildMiniSlider(
               context,
-              "HIGH PASS",
-              hpfValues[selectedLayer]!,
-              (val) => sendFilter("FILTER_HPF", hpfValues, val),
+              "LOW PASS",
+              filterValue,
+              (val) => sendFilter("FILTER_LPF", filterValues, val),
             ),
           ],
         ),
@@ -311,16 +323,16 @@ class _RemoteScreenState extends State<RemoteScreen> {
           children: [
             buildMiniSlider(
               context,
-              "RES LOW",
-              resLpfValues[selectedLayer]!,
-              (val) => sendFilter("FILTER_RES_LPF", resLpfValues, val),
+              "RES HIGH",
+              resHpfValues[selectedLayer]!,
+              (val) => sendFilter("FILTER_RES_HPF", resHpfValues, val),
             ),
             const SizedBox(width: 20),
             buildMiniSlider(
               context,
-              "RES HIGH",
-              resHpfValues[selectedLayer]!,
-              (val) => sendFilter("FILTER_RES_HPF", resHpfValues, val),
+              "RES LOW",
+              resLpfValues[selectedLayer]!,
+              (val) => sendFilter("FILTER_RES_LPF", resLpfValues, val),
             ),
           ],
         ),
@@ -340,6 +352,7 @@ class _RemoteScreenState extends State<RemoteScreen> {
             onLpfChanged: (val) => sendFilter("FILTER_LPF", filterValues, val),
             onResLpfChanged: (val) =>
                 sendFilter("FILTER_RES_LPF", resLpfValues, val),
+            onDragActiveChanged: setDragLock,
           ),
         ),
       ],
@@ -354,107 +367,132 @@ class _RemoteScreenState extends State<RemoteScreen> {
       sendOscMessage('/${selectedLayer}_$suffix', val);
     }
 
-    return Row(
-      // "start" (no "center"): asi ambas columnas arrancan a la misma altura
-      // y el final del fader se puede alinear con precision con el inicio
-      // de las etiquetas de la fila de abajo de knobs.
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return Column(
       children: [
-        // FADER DE VOLUMEN VERTICAL: el final coincide con el inicio de las
-        // etiquetas "MID-H"/"HIGH" de la rejilla de knobs.
-        Column(
+        Row(
+          // "start" (no "center"): asi ambas columnas arrancan a la misma
+          // altura y el final del fader se puede alinear con precision con
+          // el inicio de las etiquetas de la fila de abajo de knobs.
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SizedBox(
-              height: 14,
-              child: Text(
-                "VOL",
-                style: TextStyle(
-                  letterSpacing: 1.5,
-                  color: activeColor.withOpacity(0.8),
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
+            // FADER DE VOLUMEN VERTICAL: el final coincide con el inicio de las
+            // etiquetas "MID-H"/"HIGH" de la rejilla de knobs.
+            Column(
+              children: [
+                SizedBox(
+                  height: 14,
+                  child: Text(
+                    "VOL",
+                    style: TextStyle(
+                      letterSpacing: 1.5,
+                      color: activeColor.withOpacity(0.8),
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
-              ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 190,
+                  width: 44,
+                  child: RotatedBox(
+                    quarterTurns: 3,
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        activeTrackColor: activeColor,
+                        inactiveTrackColor: Colors.white10,
+                        trackHeight: 6.0,
+                        thumbColor: activeColor,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 11.0,
+                        ),
+                        overlayColor: activeColor.withOpacity(0.2),
+                        overlayShape: const RoundSliderOverlayShape(
+                          overlayRadius: 22.0,
+                        ),
+                      ),
+                      child: Slider(
+                        value: volValues[selectedLayer]!,
+                        min: 0.0,
+                        max: 1.0,
+                        onChanged: (val) => sendEq("MIX_VOL", volValues, val),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
-            SizedBox(
-              height: 190,
-              width: 44,
-              child: RotatedBox(
-                quarterTurns: 3,
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: activeColor,
-                    inactiveTrackColor: Colors.white10,
-                    trackHeight: 6.0,
-                    thumbColor: activeColor,
-                    thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 11.0,
-                    ),
-                    overlayColor: activeColor.withOpacity(0.2),
-                    overlayShape: const RoundSliderOverlayShape(
-                      overlayRadius: 22.0,
-                    ),
+            const SizedBox(width: 24),
+            // 4 KNOBS DE EQ: 2 ARRIBA, 2 ABAJO
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      RotaryKnob(
+                        label: "LOW",
+                        value: eqLowValues[selectedLayer]!,
+                        color: activeColor,
+                        size: 76,
+                        onChanged: (val) => sendEq("EQ_LOW", eqLowValues, val),
+                      ),
+                      RotaryKnob(
+                        label: "MID-L",
+                        value: eqMidLowValues[selectedLayer]!,
+                        color: activeColor,
+                        size: 76,
+                        onChanged: (val) =>
+                            sendEq("EQ_MID_LOW", eqMidLowValues, val),
+                      ),
+                    ],
                   ),
-                  child: Slider(
-                    value: volValues[selectedLayer]!,
-                    min: 0.0,
-                    max: 1.0,
-                    onChanged: (val) => sendEq("MIX_VOL", volValues, val),
+                  const SizedBox(height: 24),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      RotaryKnob(
+                        label: "MID-H",
+                        value: eqMidHighValues[selectedLayer]!,
+                        color: activeColor,
+                        size: 76,
+                        onChanged: (val) =>
+                            sendEq("EQ_MID_HIGH", eqMidHighValues, val),
+                      ),
+                      RotaryKnob(
+                        label: "HIGH",
+                        value: eqHighValues[selectedLayer]!,
+                        color: activeColor,
+                        size: 76,
+                        onChanged: (val) =>
+                            sendEq("EQ_HIGH", eqHighValues, val),
+                      ),
+                    ],
                   ),
-                ),
+                ],
               ),
             ),
           ],
         ),
-        const SizedBox(width: 24),
-        // 4 KNOBS DE EQ: 2 ARRIBA, 2 ABAJO
+        const SizedBox(height: 16),
+        // CURVA DE EQ DE 4 BANDAS: version visual nueva del mixer (el synth no
+        // dibuja una curva aqui), a juego con el dibujo del filtro: misma
+        // linea/relleno/halo de color de capa, con 4 puntitos blancos
+        // arrastrables verticalmente (uno por banda).
         Expanded(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  RotaryKnob(
-                    label: "LOW",
-                    value: eqLowValues[selectedLayer]!,
-                    color: activeColor,
-                    size: 76,
-                    onChanged: (val) => sendEq("EQ_LOW", eqLowValues, val),
-                  ),
-                  RotaryKnob(
-                    label: "MID-L",
-                    value: eqMidLowValues[selectedLayer]!,
-                    color: activeColor,
-                    size: 76,
-                    onChanged: (val) =>
-                        sendEq("EQ_MID_LOW", eqMidLowValues, val),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 24),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  RotaryKnob(
-                    label: "MID-H",
-                    value: eqMidHighValues[selectedLayer]!,
-                    color: activeColor,
-                    size: 76,
-                    onChanged: (val) =>
-                        sendEq("EQ_MID_HIGH", eqMidHighValues, val),
-                  ),
-                  RotaryKnob(
-                    label: "HIGH",
-                    value: eqHighValues[selectedLayer]!,
-                    color: activeColor,
-                    size: 76,
-                    onChanged: (val) => sendEq("EQ_HIGH", eqHighValues, val),
-                  ),
-                ],
-              ),
-            ],
+          child: EqCurve(
+            low: eqLowValues[selectedLayer]!,
+            midLow: eqMidLowValues[selectedLayer]!,
+            midHigh: eqMidHighValues[selectedLayer]!,
+            high: eqHighValues[selectedLayer]!,
+            color: activeColor,
+            onLowChanged: (val) => sendEq("EQ_LOW", eqLowValues, val),
+            onMidLowChanged: (val) => sendEq("EQ_MID_LOW", eqMidLowValues, val),
+            onMidHighChanged: (val) =>
+                sendEq("EQ_MID_HIGH", eqMidHighValues, val),
+            onHighChanged: (val) => sendEq("EQ_HIGH", eqHighValues, val),
+            onDragActiveChanged: setDragLock,
           ),
         ),
       ],
@@ -479,7 +517,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
           blendMode: BlendMode.dstIn,
           // SingleChildScrollView evita el desbordamiento (franja amarilla/negra
           // de Flutter) en pantallas mas bajas o al rotar, en vez de recortar el contenido.
+          // Tambien se bloquea mientras se arrastra un puntito: si no, un
+          // arrastre vertical sobre el filtro/EQ tambien hacia scroll en toda
+          // la pantalla a la vez.
           child: SingleChildScrollView(
+            physics: lockPageSwipe
+                ? const NeverScrollableScrollPhysics()
+                : null,
             padding: const EdgeInsets.symmetric(
               horizontal: 24.0,
               vertical: 20.0,
@@ -562,52 +606,133 @@ class _RemoteScreenState extends State<RemoteScreen> {
                 const SizedBox(height: 40),
 
                 // PANEL CENTRAL DESLIZANTE (MIXER <-> FILTRO)
-                AnimatedContainer(
-                  duration: const Duration(milliseconds: 300),
-                  height: 380,
-                  padding: const EdgeInsets.all(25),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF16161A),
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(
-                      color: activeColor.withOpacity(0.3),
-                      width: 1,
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: activeColor.withOpacity(0.05),
-                        blurRadius: 40,
-                        spreadRadius: 5,
+                // AnimatedOpacity: cuando el candado esta activado, toda esta
+                // caja se ve un poco apagada para dejar claro que esta bloqueada.
+                AnimatedOpacity(
+                  duration: const Duration(milliseconds: 200),
+                  opacity: engineLocked ? 0.5 : 1.0,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    height: 380,
+                    padding: const EdgeInsets.all(25),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF16161A),
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(
+                        color: activeColor.withOpacity(0.3),
+                        width: 1,
                       ),
-                    ],
-                  ),
-                  child: PageView(
-                    controller: enginePageController,
-                    onPageChanged: (page) =>
-                        setState(() => currentEnginePage = page),
-                    children: [
-                      buildMixerPanel(context),
-                      buildFilterPanel(context),
-                    ],
+                      boxShadow: [
+                        BoxShadow(
+                          color: activeColor.withOpacity(0.05),
+                          blurRadius: 40,
+                          spreadRadius: 5,
+                        ),
+                      ],
+                    ),
+                    // PageView.builder + AnimatedBuilder: la pagina que se va
+                    // encoge y la que entra crece, para que los bordes de los
+                    // dos dibujos (EQ/filtro) no se solapen feo a medio swipe.
+                    child: PageView.builder(
+                      controller: enginePageController,
+                      // Se bloquea mientras se arrastra un puntito del filtro
+                      // o de la curva de EQ, para que no compitan por el mismo
+                      // gesto.
+                      physics: lockPageSwipe
+                          ? const NeverScrollableScrollPhysics()
+                          : null,
+                      onPageChanged: (page) =>
+                          setState(() => currentEnginePage = page),
+                      itemCount: 2,
+                      itemBuilder: (context, index) {
+                        final page = index == 0
+                            ? buildMixerPanel(context)
+                            : buildFilterPanel(context);
+                        return AnimatedBuilder(
+                          animation: enginePageController,
+                          builder: (context, child) {
+                            double current = currentEnginePage.toDouble();
+                            if (enginePageController.hasClients &&
+                                enginePageController.page != null) {
+                              current = enginePageController.page!;
+                            }
+                            final distance = (current - index).abs().clamp(
+                              0.0,
+                              1.0,
+                            );
+                            final scale = 1.0 - (distance * 0.12);
+                            final fade = 1.0 - (distance * 0.5);
+                            return Opacity(
+                              opacity: fade,
+                              child: Transform.scale(
+                                scale: scale,
+                                child: child,
+                              ),
+                            );
+                          },
+                          // Con el candado puesto, esta pagina no responde a
+                          // toques (sliders/knobs/puntitos), pero el PageView
+                          // que la contiene sigue recibiendo el swipe normal.
+                          child: AbsorbPointer(
+                            absorbing: engineLocked,
+                            child: page,
+                          ),
+                        );
+                      },
+                    ),
                   ),
                 ),
                 const SizedBox(height: 12),
-                // PUNTOS INDICADORES DE PAGINA
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: List.generate(2, (i) {
-                    final isActive = currentEnginePage == i;
-                    return AnimatedContainer(
-                      duration: const Duration(milliseconds: 250),
-                      margin: const EdgeInsets.symmetric(horizontal: 3),
-                      width: isActive ? 18 : 6,
-                      height: 6,
-                      decoration: BoxDecoration(
-                        color: isActive ? activeColor : Colors.white24,
-                        borderRadius: BorderRadius.circular(3),
+                // PUNTOS INDICADORES DE PAGINA + BOTON DE CANDADO (a la derecha)
+                Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: List.generate(2, (i) {
+                        final isActive = currentEnginePage == i;
+                        return AnimatedContainer(
+                          duration: const Duration(milliseconds: 250),
+                          margin: const EdgeInsets.symmetric(horizontal: 3),
+                          width: isActive ? 18 : 6,
+                          height: 6,
+                          decoration: BoxDecoration(
+                            color: isActive ? activeColor : Colors.white24,
+                            borderRadius: BorderRadius.circular(3),
+                          ),
+                        );
+                      }),
+                    ),
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: GestureDetector(
+                        onTap: () =>
+                            setState(() => engineLocked = !engineLocked),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          width: 34,
+                          height: 34,
+                          decoration: BoxDecoration(
+                            color: engineLocked
+                                ? activeColor.withOpacity(0.15)
+                                : const Color(0xFF1A1A1D),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: engineLocked
+                                  ? activeColor
+                                  : Colors.white12,
+                              width: 1.5,
+                            ),
+                          ),
+                          child: Icon(
+                            engineLocked ? Icons.lock : Icons.lock_open,
+                            size: 16,
+                            color: engineLocked ? activeColor : Colors.white38,
+                          ),
+                        ),
                       ),
-                    );
-                  }),
+                    ),
+                  ],
                 ),
 
                 // Separa la caja deslizante + puntos del boton de REC de abajo.

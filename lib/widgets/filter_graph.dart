@@ -20,6 +20,9 @@ class FilterGraph extends StatefulWidget {
   final ValueChanged<double> onResHpfChanged;
   final ValueChanged<double> onLpfChanged;
   final ValueChanged<double> onResLpfChanged;
+  // Avisa mientras se arrastra un punto, para que la pantalla que lo contiene
+  // (el PageView deslizante) deje de intentar cambiar de pagina a la vez.
+  final ValueChanged<bool>? onDragActiveChanged;
 
   const FilterGraph({
     super.key,
@@ -32,6 +35,7 @@ class FilterGraph extends StatefulWidget {
     required this.onResHpfChanged,
     required this.onLpfChanged,
     required this.onResLpfChanged,
+    this.onDragActiveChanged,
   });
 
   @override
@@ -59,7 +63,7 @@ class _FilterGraphState extends State<FilterGraph> {
     return outMin + (outMax - outMin) * ((v - inMin) / (inMax - inMin));
   }
 
-  void _onPointer(Offset pos, Size size, {required bool isStart}) {
+  void _onDown(Offset pos, Size size) {
     final hpfDot = Offset(
       widget.hpf * size.width,
       _dotY(widget.resHpf, size.height),
@@ -69,19 +73,20 @@ class _FilterGraphState extends State<FilterGraph> {
       _dotY(widget.resLpf, size.height),
     );
 
-    if (isStart) {
-      const hitRadius =
-          26.0; // mas generoso que en JUCE: aqui se toca con el dedo, no con el raton
-      if ((pos - hpfDot).distance < hitRadius) {
-        _draggedDot = 0;
-      } else if ((pos - lpfDot).distance < hitRadius) {
-        _draggedDot = 1;
-      } else {
-        _draggedDot = -1;
-      }
-      return;
+    const hitRadius =
+        28.0; // mas generoso que en JUCE: aqui se toca con el dedo, no con el raton
+    if ((pos - hpfDot).distance < hitRadius) {
+      _draggedDot = 0;
+    } else if ((pos - lpfDot).distance < hitRadius) {
+      _draggedDot = 1;
+    } else {
+      _draggedDot = -1;
+      return; // no hemos tocado ningun punto: dejamos el gesto libre para el swipe
     }
+    widget.onDragActiveChanged?.call(true);
+  }
 
+  void _onMove(Offset pos, Size size) {
     if (_draggedDot == -1) return;
 
     final px = (pos.dx / size.width).clamp(0.0, 1.0);
@@ -98,16 +103,27 @@ class _FilterGraphState extends State<FilterGraph> {
     }
   }
 
+  void _onUp() {
+    if (_draggedDot == -1) return;
+    _draggedDot = -1;
+    widget.onDragActiveChanged?.call(false);
+  }
+
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = Size(constraints.maxWidth, constraints.maxHeight);
-        return GestureDetector(
-          onPanStart: (d) => _onPointer(d.localPosition, size, isStart: true),
-          onPanUpdate: (d) =>
-              setState(() => _onPointer(d.localPosition, size, isStart: false)),
-          onPanEnd: (_) => _draggedDot = -1,
+        // Listener (eventos crudos de puntero) en vez de GestureDetector:
+        // asi no entra en la "arena de gestos" del PageView que envuelve este
+        // panel, y podemos decidir nosotros mismos, en el propio pointer-down,
+        // si el toque es sobre un punto (lo capturamos) o no (dejamos que el
+        // PageView reciba el swipe con normalidad).
+        return Listener(
+          onPointerDown: (d) => _onDown(d.localPosition, size),
+          onPointerMove: (d) => setState(() => _onMove(d.localPosition, size)),
+          onPointerUp: (_) => setState(_onUp),
+          onPointerCancel: (_) => setState(_onUp),
           child: CustomPaint(
             size: size,
             painter: _FilterGraphPainter(
